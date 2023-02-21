@@ -6,6 +6,7 @@ import sys
 from glob import glob
 from pathlib import Path
 
+import json
 import torch
 
 sys.path.insert(0, '.')
@@ -38,12 +39,18 @@ class SportsAndNews(torch.utils.data.Dataset):
         self.vis_load_backend = vis_load_backend
         self.size_ratio = size_ratio # used to do curriculum learning
 
-        print('TRANSFORMS', self.transforms)
-
         if split == 'test' or split == 'train': # TODO: Existing code only supports evaluation on the "test" split; using our val split for that, but will need to refactor if we want to do both using their code
             data_csv = open('data/sports_and_news_normal.evaluation.csv').readlines()
             offset_path = 'data/sports_and_news_normal.evaluation.json'
             skip_ids = [line.strip() for line in open('data/sports_and_news_normal.evaluation.skip_id_list.txt')]
+        elif split == 'train':
+            data_csv = open(f'data/sports_and_news_normal.train.csv').readlines()
+            offset_path = f'data/sports_and_news_normal.train.json'
+            skip_ids = []
+        elif split == 'valid':
+            data_csv = open(f'data/sports_and_news_normal.test.csv').readlines()
+            offset_path = f'data/sports_and_news_normal.test.json'
+            skip_ids = []
         else:
             self.dataset = [0]
             return # Not set up yet!
@@ -91,23 +98,26 @@ class SportsAndNews(torch.utils.data.Dataset):
 
         logger.info(f'{split} has {len(self.dataset)} items')
 
-        # self.check_lengths()
+    # TODO: Move this check into the metadata loader on the dataset
+    #     self.check_lengths()
 
-    def check_lengths(self):
-        failed_vids = []
-        for i in range(len(self.dataset)):
-            video_id, path, start = self.dataset[i] 
-            rgb, audio, meta = get_video_and_audio(path, get_meta=True, max_clip_len_sec=self.max_clip_len_sec, start_sec=start)
-            if rgb == None:
-                failed_vids.append(self.dataset[i])
-        print(len(failed_vids), 'total videos failed')
-        json.dump(failed_vids, 'all_failed_vids.json')
+    # def check_lengths(self):
+    #     failed_vids = []
+    #     for i in range(len(self.dataset)):
+    #         video_id, path, start = self.dataset[i] 
+    #         rgb, audio, meta = get_video_and_audio(path, get_meta=True, max_clip_len_sec=self.max_clip_len_sec, start_sec=start)
+    #         if rgb == None:
+    #             failed_vids.append(self.dataset[i])
+    #     print(len(failed_vids), 'total videos failed')
+    #     with open(f'all_failed_vids.{self.split}.json', 'wb') as file:
+    #         json.dump({"data": failed_vids}, file)
 
     def __getitem__(self, index):
         video_id, path, start = self.dataset[index] 
 
         rgb, audio, meta = get_video_and_audio(path, get_meta=True, max_clip_len_sec=self.max_clip_len_sec, start_sec=start)
         
+
         # (Tv, 3, H, W) in [0, 225], (Ta, C) in [-1, 1]
         item = {
                 'video': rgb,
