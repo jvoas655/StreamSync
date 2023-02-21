@@ -38,7 +38,9 @@ class SportsAndNews(torch.utils.data.Dataset):
         self.vis_load_backend = vis_load_backend
         self.size_ratio = size_ratio # used to do curriculum learning
 
-        if split == 'test': # TODO: Existing code only supports evaluation on the "test" split; using our val split for that, but will need to refactor if we want to do both using their code
+        print('TRANSFORMS', self.transforms)
+
+        if split == 'test' or split == 'train': # TODO: Existing code only supports evaluation on the "test" split; using our val split for that, but will need to refactor if we want to do both using their code
             data_csv = open('data/sports_and_news_normal.evaluation.csv').readlines()
             offset_path = 'data/sports_and_news_normal.evaluation.json'
             skip_ids = [line.strip() for line in open('data/sports_and_news_normal.evaluation.skip_id_list.txt')]
@@ -118,14 +120,13 @@ class SportsAndNews(torch.utils.data.Dataset):
         }
 
         # loading the fixed offsets. COMMENT THIS IF YOU DON'T HAVE A FILE YET
-        if self.load_fixed_offsets_on_test and self.split in ['valid', 'test']:
+        if self.load_fixed_offsets_on_test and self.split in ['valid', 'test', 'train']:
             item['targets']['offset_sec'] = self.vid2offset_params[video_id]['offset_sec']
             item['targets']['v_start_i_sec'] = self.vid2offset_params[video_id]['v_start_i_sec']
 
             if self.transforms is not None:
                 item = self.transforms(item) # , skip_start_offset=True)
                 # TODO: Changed functionality of a transform to make this work; may need to change back for original SparseSync datasets to work
-
         return item
 
     def __len__(self):
