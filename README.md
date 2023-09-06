@@ -1,5 +1,7 @@
 # UT Fork of SparseSync
 
+To run tests with the original model architecture, set model.params.transformer.params.ablate_mixer and model.params.transformer.params.ablate_selector to "True" in the config file. To run tests with the additional features added by James, set both to "False". 
+
 Below README.md file is from the original SparseSync repo. This fork exists for evaluating SparseSync on our data and experimenting with modifications to the SparseSync architecture. 
 
 
