@@ -69,7 +69,7 @@ class SportsAndNews(torch.utils.data.Dataset):
         clip_paths = []
 
         # broken_vids = skip_ids #'bcdWbE64hDE_900_1200', 'alY7_M_ibR4_900_1200']
-        broken_vids = [line.strip() for line in open(f"data/sports_and_news_{distribution_type}.skip_id_list.txt", "r")]
+        broken_vids = [line.strip() for line in open(f"sports_and_news_{distribution_type}.{self.split}.skip_id_list.txt", "r")]
 
         for line in data_csv:
             skip = 'broken' in line
@@ -95,8 +95,8 @@ class SportsAndNews(torch.utils.data.Dataset):
                 assert(len(file_name_chunks) >= 5)
                 file_stem = '_'.join(file_name_chunks[:-2])
                 video_folder = '_'.join(file_name_chunks[:-4])
-                full_path = '/data3/scratch/videos_at_25fps-encode_script/' + video_folder + '/' + file_stem + '.mkv'
-                # full_path = '/saltpool0/data/datasets/avsync/data/v5/videos_at_25fps-encode_script/rOn7uGVVf1I/rOn7uGVVf1I_3000_3300.mkv'
+                # full_path = '/data3/scratch/videos_at_25fps-encode_script/' + video_folder + '/' + file_stem + '.mkv'
+                full_path = '/saltpool0/data/datasets/avsync/data/v5/videos_at_25fps-encode_script/rOn7uGVVf1I/rOn7uGVVf1I_3000_3300.mkv'
                 video_id = line.split(',')[0]
                 tup = (video_id, full_path, float(line.split(',')[1]))
                 clip_paths.append(tup)
@@ -181,6 +181,7 @@ class SportsAndNews(torch.utils.data.Dataset):
                         item = self.transforms(item) # , skip_start_offset=True)
                     except:
                         print(f"Failed id: {video_id}\nOffset: {item['targets']['offset_sec']}, Start: {item['targets']['v_start_i_sec']}")
+
                         print('item is', item)
                         print('for path', path)
                         print('video shape is', item['video'].shape)
@@ -227,9 +228,6 @@ class SportsAndNews(torch.utils.data.Dataset):
                 json.dump(self.transforms_times, open('transforms_times.json', 'w'))
 
             return item
-            # except:
-            # print('Failed on video', self.dataset[index][0], 'for a reason other than the transforms')
-            # return self[index-1]
 
     def __len__(self):
         return len(self.dataset)
