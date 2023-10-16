@@ -139,6 +139,8 @@ class SportsAndNews(torch.utils.data.Dataset):
             if path in self.too_long_paths:
                 return self[index - 1]
 
+            """
+            Length check should no longer be necessary after re-generating data
             video_lengths = self.lengths_dict['./'+path[15:]]
             if (start + self.max_clip_len_sec) > min(video_lengths):
                 # print('Val set item', path, 'with fixed start time', start, 'runs over the end of the tracks at', min(video_lengths))
@@ -147,6 +149,7 @@ class SportsAndNews(torch.utils.data.Dataset):
             elif start <= 10:
                 # Nearly all failures are from the video having only 7-9s of frames when the start time is 10s for some reason
                 start += 5
+            """
             start_load = time.time()
             rgb, audio, meta = get_video_and_audio(path, get_meta=True, max_clip_len_sec=self.max_clip_len_sec, start_sec=start)
             end_load = time.time()
