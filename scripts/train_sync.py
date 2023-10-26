@@ -207,6 +207,7 @@ def train(cfg):
     iter_times = cfg.data.dataset.params.get('iter_times', 1)
     for it in range(iter_times):
         prog_bar = tqdm(loaders[phase], f'{phase} ({ckpt_epoch})', ncols=0)
+        all_dumped_attns = []
         for iter_step, batch in enumerate(prog_bar):
             # sends inputs and targets to cuda
             aud, vid, targets = prepare_inputs(batch, device, phase)
@@ -215,7 +216,32 @@ def train(cfg):
             # gradient and half-precision toggles
             with torch.set_grad_enabled(False):
                 with torch.autocast('cuda', enabled=cfg.training.use_half_precision):
-                    loss, logits = model(vid, aud, targets)
+                    if cfg.training.dump_attn_weights and len(all_dumped_attns) < 100:
+                        new_attn_dict = {
+                            'path': batch['path'],
+                            'targets': batch['targets'],
+                            'start': batch['start'],
+                        }
+                        if cfg.model.params.transformer.params.ablate_mixer:
+                            # Only one round of selectors
+                            loss, logits, vsa1, asa1, vca1, aca1 = model(vid, aud, targets, return_attn_weights=True)
+                        else:
+                            loss, logits, vsa1, asa1, vca1, aca1, vsa2, asa2, vca2, aca2 = model(vid, aud, targets, return_attn_weights=True)
+                            new_attn_dict['vis_self_attn_2'] = vsa2
+                            new_attn_dict['aud_self_attn_2'] = asa2
+                            new_attn_dict['vis_cross_attn_2'] = vca2
+                            new_attn_dict['aud_cross_attn_2'] = aca2
+                        new_attn_dict['loss'] = loss
+                        new_attn_dict['logits'] = logits
+                        new_attn_dict['vis_self_attn_1'] = vsa1
+                        new_attn_dict['aud_self_attn_1'] = asa1
+                        new_attn_dict['vis_cross_attn_1'] = vca1
+                        new_attn_dict['aud_cross_attn_1'] = aca1
+                        for k in new_attn_dict.keys():
+                            new_attn_dict[k].detach().cpu() # Don't require GPU to open
+                        all_dumped_attns.append(new_attn_dict)
+                    else:
+                        loss, logits = model(vid, aud, targets)
 
             # gathering results in one place to iterate on this later
             try:

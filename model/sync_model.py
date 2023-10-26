@@ -21,8 +21,10 @@ class AVSyncModel(torch.nn.Module):
         self.a_bridge = instantiate_from_config(a_bridge_cfg)
         ## uncomment if doing crop start debugging
         self.transformer = instantiate_from_config(transformer)
+        # Assuming we're using either both selectors and mixer or neither
+        self.use_mixer = not transformer.params.mixed_selector_cfg.params.ablate_mixer
 
-    def forward(self, vis: torch.Tensor, aud: torch.Tensor, targets: dict = None):
+    def forward(self, vis: torch.Tensor, aud: torch.Tensor, targets: dict = None, return_attn_weights=False):
         '''
         Args:
             vis (torch.Tensor): RGB frames (B, Tv, C, H, W)
@@ -36,14 +38,26 @@ class AVSyncModel(torch.nn.Module):
         vis = self.v_bridge(vis.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         aud = self.a_bridge(aud)
 
-        logits = self.transformer(vis, aud)
+        if return_attn_weights:
+            if self.use_mixer:
+                logits, vsa1, asa1, vca1, aca1, vsa2, asa2, vca2, aca2 = self.transformer(vis, aud, return_attn_weights=return_attn_weight)
+            else:
+                logits, vsa1, asa1, vca1, aca1 = self.transformer(vis, aud, return_attn_weights=return_attn_weights)
+        else:
+            logits = self.transformer(vis, aud)
 
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits, targets['offset_target'])
 
-        return loss, logits
+        if return_attn_weights:
+            if self.use_mixer:
+                loss, logits, vsa1, asa1, vca1, aca1, vsa2, asa2, vca2, aca2
+            else:
+                return loss, logits, vsa1, asa1, vca1, aca1
+        else:
+            return loss, logits
 
 
 if __name__ == '__main__':

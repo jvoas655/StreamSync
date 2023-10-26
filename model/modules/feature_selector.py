@@ -14,7 +14,7 @@ class SparseSync(torch.nn.Module):
 
     def __init__(
         self, vis_pos_emb_module, aud_pos_emb_module, num_offset_cls,
-        visual_block_shape, audio_block_shape, pre_norm_cfg, v_selector_cfg, a_selector_cfg, global_transformer_cfg,
+        visual_block_shape, audio_block_shape, pre_norm_cfg, v_selector_cfg, a_selector_cfg, mixed_selector_cfg, global_transformer_cfg,
         n_layer=12, n_head=8, n_embd=256, tok_pdrop=0., embd_pdrop=0., resid_pdrop=0., attn_pdrop=0.,
         n_unmasked=0, selector_mixing=True, ablate_mixer=False, ablate_selector=False
     ):
@@ -39,7 +39,7 @@ class SparseSync(torch.nn.Module):
         # Add the Selector Mixing Transformer Here
         self.selector_mixing = selector_mixing
         if self.selector_mixing:
-            self.va_selector_mixer = FeatureSelectorMixingTransformer(self.v_selector.num_selectors, self.a_selector.num_selectors, v_selector_cfg, a_selector_cfg, n_embd, n_head)
+            self.va_selector_mixer = FeatureSelectorMixingTransformer(self.v_selector.num_selectors, self.a_selector.num_selectors, mixed_selector_cfg, n_embd, n_head)
 
         # aggregation transformer
         self.global_transformer = instantiate_from_config(global_transformer_cfg)  # GlobalTransformer
@@ -52,7 +52,7 @@ class SparseSync(torch.nn.Module):
 
         self.apply(init_weights)
 
-    def forward(self, vis: torch.Tensor, aud: torch.Tensor):
+    def forward(self, vis: torch.Tensor, aud: torch.Tensor, return_attn_weights=False):
         B, Tv, Dv, H, W = vis.shape
         B, Da, F, Ta = aud.shape
         assert Da == Dv, f'Please define a bridge or fix {Da} vs {Dv}'
@@ -62,45 +62,63 @@ class SparseSync(torch.nn.Module):
         vis, aud = self.pre_lnorm_vis(vis), self.pre_lnorm_aud(aud)
         # apply individual pos embeddings
         vis_context, aud_context = self.vis_pos_emb(vis), self.aud_pos_emb(aud)
-        # narrow down the dimension with selectors
-        vis, aud = self.v_selector(vis_context), self.a_selector(aud_context)
+        
+        if return_attn_weights:
+            vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)
+            aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights)
+        else:
+            # narrow down the dimension with selectors
+            vis, aud = self.v_selector(vis_context), self.a_selector(aud_context)
 
         # mix selectors
         if self.selector_mixing:
-            vis, aud = self.va_selector_mixer(vis, aud, vis_context, aud_context)
+            if return_attn_weights:
+                vis, aud, vis_self_attns2, aud_self_attns2, vis_cross_attns2, aud_cross_attns2 = self.va_selector_mixer(vis, aud, vis_context, aud_context, return_attn_weights=return_attn_weights)
+            else:
+                vis, aud = self.va_selector_mixer(vis, aud, vis_context, aud_context)
         
         # aggregate infomation
         off_logits = self.global_transformer(vis, aud)
         # picking the first token which correspond to the `off_tok` as the prediction token
         off_logits = self.off_head(off_logits[:, 0, :])
-        return off_logits
+        if return_attn_weights:
+            if self.selector_mixing:
+                return off_logits, vis_self_attns1, aud_self_attns1, vis_cross_attns1, aud_cross_attns1, vis_self_attns2, aud_self_attns2, vis_cross_attns2, aud_cross_attns2
+            else:
+                return off_logits, vis_self_attns1, aud_self_attns1, vis_cross_attns1, aud_cross_attns1 # No second round of selectors
+        else:
+            return off_logits
 
 class FeatureSelectorMixingTransformer(torch.nn.Module):
 
-    def __init__(self, vis_n_selectors, aud_n_selectors, v_selector_cfg, a_selector_cfg, n_embd, n_head):
+    def __init__(self, vis_n_selectors, aud_n_selectors, mixed_selector_cfg, n_embd, n_head):
         super().__init__()
         self.vis_n_selectors = vis_n_selectors
         self.aud_n_selectors = aud_n_selectors
-        assert(v_selector_cfg.params.ablate_mixer == a_selector_cfg.params.ablate_mixer)
-        assert(v_selector_cfg.params.ablate_selector == a_selector_cfg.params.ablate_selector)
-        self.use_mixer = not v_selector_cfg.params.ablate_mixer
-        self.use_selector = not v_selector_cfg.params.ablate_selector
+        self.use_mixer = not mixed_selector_cfg.params.ablate_mixer
+        self.use_selector = not mixed_selector_cfg.params.ablate_selector
         if self.use_mixer:
             self.transformer = torch.nn.TransformerEncoder(
-                torch.nn.TransformerEncoderLayer(n_embd, n_head, 4 * n_embd), 3)
+                torch.nn.TransformerEncoderLayer(n_embd, n_head, 4 * n_embd), 1) # Reduce number of additional parameters
         if self.use_selector:
             # Try using all selectors for a & v
-            self.v_selector = instantiate_from_config(v_selector_cfg)
-            self.a_selector = instantiate_from_config(a_selector_cfg)
+            self.v_selector = instantiate_from_config(mixed_selector_cfg) # FeatureSelectorTransformer
+            self.a_selector = instantiate_from_config(mixed_selector_cfg) # FeatureSelectorTransformer
         self.apply(init_weights)
 
-    def forward(self, vis_selectors, aud_selectors, vis_context, aud_context):
+    def forward(self, vis_selectors, aud_selectors, vis_context, aud_context, return_attn_weights=False):
         if self.use_mixer:
             all_selectors = torch.cat((vis_selectors, aud_selectors), dim=1)
             mixed_selectors = self.transformer(all_selectors)
             vis_selectors, aud_selectors = torch.split(mixed_selectors, [self.vis_n_selectors, self.aud_n_selectors], dim=1)
         if self.use_selector:
-            vis_selectors, aud_selectors = self.v_selector(vis_context, vis_selectors), self.a_selector(aud_context, aud_selectors)
+            if return_attn_weights:
+                vis_selectors, vis_self_attns, vis_cross_attns = self.v_selector(vis_context, vis_selectors, return_attn_weights=return_attn_weights)
+                aud_selectors, aud_self_attns, aud_cross_attns = self.a_selector(aud_context, aud_selectors, return_attn_weights=return_attn_weights)
+                return vis_selectors, aud_selectors, vis_self_attns, aud_self_attns, vis_cross_attns, aud_cross_attns
+            else:
+                vis_selectors, aud_selectors = self.v_selector(vis_context, vis_selectors), self.a_selector(aud_context, aud_selectors)
+                return vis_selectors, aud_selectors
         return vis_selectors, aud_selectors
 
 class FeatureSelectorTransformer(torch.nn.Module):
@@ -126,7 +144,7 @@ class FeatureSelectorTransformer(torch.nn.Module):
         self.apply(init_weights)
         logger.info(f'Selector has {num_selectors} selectors')
 
-    def forward(self, context, selectors=None):
+    def forward(self, context, selectors=None, return_attn_weights=False):
         '''takes in a set of features (context): (B, Tv, H, W, Dv) or (B, F, Ta, Da)'''
         B, D = context.shape[0], context.shape[-1]
         # (B, T, D) <= flattening the context
@@ -142,11 +160,24 @@ class FeatureSelectorTransformer(torch.nn.Module):
         selectors = selectors if self.pos_emb_cfg is None else self.selectors_pos_emb(selectors)
         # dropout
         selectors, context = self.selectors_drop(selectors), self.context_drop(context)
-        # apply a stack of decoder-like blocks
-        selectors, context = self.blocks((selectors, context))
+        
+        if return_attn_weights:
+            self_attns = []
+            cross_attns = []
+            for i in range(len(self.blocks)):
+                # Apply blocks one-at-a-time to collect attns
+                selectors, context, self_attn, cross_attn = self.blocks[i]((selectors, context), return_attn_weights=return_attn_weights)
+                self_attns.append(self_attn)
+                cross_attns.append(cross_attn)
 
-        # (B, num_selectors, D)
-        return selectors
+            return selectors, self_attns, cross_attns
+        else:
+            
+            # apply a stack of decoder-like blocks
+            selectors, context = self.blocks((selectors, context))
+
+            # (B, num_selectors, D)
+            return selectors
 
 
 class GlobalTransformer(torch.nn.Module):
@@ -293,11 +324,19 @@ class CrossBlock(torch.nn.Module):
             torch.nn.Dropout(config.resid_pdrop),
         )
 
-    def forward(self, x: tuple) -> tuple:
+    def forward(self, x: tuple, return_attn_weights=False) -> tuple:
         x, context = x
-        x = x + self.attn(self.ln1(x))
-        x = x + self.xattn(self.ln2(x), context)
+        if return_attn_weights:
+            res, self_attn = self.attn(self.ln1(x), return_attn_weights=return_attn_weights)
+            x += res
+            res, cross_attn = self.xattn(self.ln2(x), context, return_attn_weights=return_attn_weights)
+            x += res
+        else:
+            x = x + self.attn(self.ln1(x))
+            x = x + self.xattn(self.ln2(x), context)
         x = x + self.mlp(self.ln3(x))
+        if return_attn_weights:
+            return x, context, self_attn, cross_attn
         return x, context
 
 
@@ -306,7 +345,7 @@ class CrossAttention(SelfAttention):
     def __init__(self, config):
         super().__init__(config)
 
-    def forward(self, x, context):
+    def forward(self, x, context, return_attn_weights=False):
         B, Tx, C = x.size()
         B, Tc, C = context.size()
 
@@ -325,6 +364,8 @@ class CrossAttention(SelfAttention):
         # output projection
         y = self.resid_drop(self.proj(y))
 
+        if return_attn_weights:
+            return y, att
         return y
 
 

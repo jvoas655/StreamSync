@@ -57,7 +57,7 @@ class SelfAttention(nn.Module):
         # self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
 
-    def forward(self, x):
+    def forward(self, x, return_attn_weights=False):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -75,6 +75,8 @@ class SelfAttention(nn.Module):
         # output projection
         y = self.resid_drop(self.proj(y))
 
+        if return_attn_weights:
+            return y, att
         return y
 
 
@@ -94,6 +96,7 @@ class Block(nn.Module):
         )
 
     def forward(self, x):
+        # No need to enable returning attention weights, since this block isn't used in selectors
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
