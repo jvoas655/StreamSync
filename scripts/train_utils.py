@@ -94,6 +94,9 @@ def get_datasets(cfg, transforms):
         'valid': DatasetClass('valid', vids_path, transforms['test'],
                               load_fixed_offsets_on_test=load_fixed_offsets_on_test,
                               vis_load_backend=vis_load_backend, size_ratio=size_ratio),
+        'valid-random': DatasetClass('valid-random', vids_path, transforms['test'],
+                              load_fixed_offsets_on_test=load_fixed_offsets_on_test,
+                              vis_load_backend=vis_load_backend, size_ratio=size_ratio),
         'test': DatasetClass('test', vids_path, transforms['test'],
                              load_fixed_offsets_on_test=load_fixed_offsets_on_test,
                              vis_load_backend=vis_load_backend),
@@ -111,6 +114,7 @@ def get_batch_sizes(cfg, num_gpus):
 def get_loaders(cfg, datasets, batch_sizes):
     train_sampler = DistributedSampler(datasets['train'], shuffle=True) if dist.is_initialized() else None
     valid_sampler = DistributedSampler(datasets['valid'], shuffle=False) if dist.is_initialized() else None
+    valid_random_sampler = DistributedSampler(datasets['valid'], shuffle=False) if dist.is_initialized() else None
     test_sampler = DistributedSampler(datasets['test'], shuffle=False) if dist.is_initialized() else None
     # what is the portion of the valid dataset to used for the `run_corrupted_valid` (turned off by default)
     subset_size = 0.2
@@ -125,6 +129,9 @@ def get_loaders(cfg, datasets, batch_sizes):
         'valid': DataLoader(
             datasets['valid'], batch_sizes['test'], shuffle=False,
             sampler=valid_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
+        'valid-random': DataLoader(
+            datasets['valid-random'], batch_sizes['test'], shuffle=False,
+            sampler=valid_random_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
         'test': DataLoader(
             datasets['test'], batch_sizes['test'], shuffle=False,
             sampler=test_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
@@ -193,23 +200,56 @@ def get_lr_scheduler(cfg, optimizer):
         ], milestones=[warmup])
     elif cfg.training.lr_scheduler.name == 'constant':
         lr_sched = lr_scheduler.ConstantLR(optimizer, factor=1)
+    elif cfg.training.lr_scheduler.name == 'warmup_constant_decay':
+        warmup = cfg.training.lr_scheduler.warmup# * 860 # steps per epoch
+        constant = cfg.training.lr_scheduler.constant# * 860
+        remaining = cfg.training.lr_scheduler.remaining# * 860
+        lr_sched = lr_scheduler.SequentialLR(optimizer, schedulers=[
+            lr_scheduler.LinearLR(optimizer, start_factor=1/100, total_iters=warmup),
+            lr_scheduler.ConstantLR(optimizer, factor=1, total_iters=constant),
+            lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=1/10000, total_iters=remaining)
+        ], milestones=[warmup, warmup+constant])
     return lr_sched
 
 
+# Add resume option
 def load_ckpt(cfg, model_wo_ddp, optimizer, scaler, lr_scheduler):
     ckpt = torch.load(cfg.ckpt_path, map_location=torch.device('cpu'))
     ckpt_cfg = ckpt['args']
-    model_wo_ddp.load_state_dict(ckpt['model'])
-    optimizer.load_state_dict(ckpt['optimizer'])
-    scaler.load_state_dict(ckpt['scaler'])
-    lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+    model_wo_ddp.load_state_dict(ckpt['model'], strict=False)
+    if cfg.resume_scheduler_opt_scaler:
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scaler.load_state_dict(ckpt['scaler'])
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+    """
+    Old version:
+    try:
+        model_wo_ddp.load_state_dict(ckpt['model'])
+        model_only_params = [] # Perfect match
+    except:
+        d1 = ckpt['model']
+        d2 = model_wo_ddp.state_dict()
+        ckpt_only_params = []
+        model_only_params = []
+        for k in d1:
+            if k not in d2:
+                ckpt_only_params.append(k)
+        for k in d2:
+            if k not in d1:
+                model_only_params.append(k)
+        assert(len(ckpt_only_params) == 0)
+        model_wo_ddp.load_state_dict(ckpt['model'], strict=False)
+    # optimizer.load_state_dict(ckpt['optimizer'])
+    # scaler.load_state_dict(ckpt['scaler'])
+    # lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+    """
     start_epoch = ckpt['epoch']
     # restarting training counters if the ckpt is used to init weights rather than continuing training
     if cfg.training.finetune:
         old_vid_dir = f'{Path(ckpt_cfg.data.vids_path).stem}/{Path(ckpt_cfg.data.vids_path).parent.stem}'
         new_vid_dir = f'{Path(cfg.data.vids_path).stem}/{Path(cfg.data.vids_path).parent.stem}'
-        assert old_vid_dir != new_vid_dir, f'old: {old_vid_dir}; new: {new_vid_dir}'
-        assert ckpt_cfg.data.dataset.target != cfg.data.dataset.target, ckpt_cfg.data.dataset.target
+        # assert old_vid_dir != new_vid_dir, f'old: {old_vid_dir}; new: {new_vid_dir}'
+        # assert ckpt_cfg.data.dataset.target != cfg.data.dataset.target, ckpt_cfg.data.dataset.target
         logger.info(f'Finetuning from: {ckpt_cfg.ckpt_path} on {cfg.data.dataset.target}')
         ckpt['metrics'][cfg.training.metric_name] = 0 if cfg.training.to_max_metric else float('inf')
         start_epoch = 0
@@ -219,7 +259,7 @@ def load_ckpt(cfg, model_wo_ddp, optimizer, scaler, lr_scheduler):
     # a bit ugly but it patches checkpoints produced by the 'old' code
     metrics = ckpt['metrics']
     metrics = metrics.get('off', metrics)
-    return start_epoch, metrics[cfg.training.metric_name]
+    return start_epoch, metrics[cfg.training.metric_name], model_only_params
 
 
 class EarlyStopper(object):
@@ -260,9 +300,34 @@ class EarlyStopper(object):
         return self.best_metric < new_metric_val if self.to_max else self.best_metric > new_metric_val
 
 
-def toggle_mode(cfg, model, phase):
+def toggle_mode(cfg, model, phase, epoch, model_only_params):
     if phase == 'train':
         model.train()
+        if cfg.training.freeze_first > epoch: # Only freeze for the first few epochs
+            for n,p in model.named_parameters():
+                if (n in model_only_params) or (n[7:] in model_only_params): # First 7 chars are 'module.' if dist.is_initialized()
+                    p.requires_grad = True # Parameters not loaded from the ckpt should be trained
+                else:
+                    p.requires_grad = False # Parameters loaded from the ckpt are frozen
+        elif cfg.training.freeze_first == epoch:
+            # First epoch back, so need to un-freeze everything
+            for n,p in model.named_parameters():
+                p.requires_grad = True
+            # Re-freeze extractors if not trainable
+            if cfg.model.params.vfeat_extractor.is_trainable is False:
+                if dist.is_initialized():
+                    for params in model.module.vfeat_extractor.parameters():
+                        params.requires_grad = False
+                else:
+                    for params in model.vfeat_extractor.parameters():
+                        params.requires_grad = False
+            if cfg.model.params.afeat_extractor.is_trainable is False:
+                if dist.is_initialized():
+                    for params in model.module.afeat_extractor.parameters():
+                        params.requires_grad = False
+                else:
+                    for params in model.afeat_extractor.parameters():
+                        params.requires_grad = False
         if cfg.model.params.afeat_extractor.is_trainable is False:
             if dist.is_initialized():
                 model.module.afeat_extractor.eval()

@@ -43,6 +43,10 @@ def train(cfg):
 
     logger.log_param_num(global_rank, model)
 
+    # Add DataParallel for multiple GPUS
+    model = torch.nn.DataParallel(model)
+    model_only_params = [] # Written over in loading checkpoint; used to freeze loaded params while training new ones if freeze_first > 0
+
     early_stopper = EarlyStopper(cfg.training.patience, cfg.training.to_max_metric, cfg.training.metric_name)
 
     # the scaller for the loss. Helps to avoid precision underflow during half prec training
@@ -50,7 +54,7 @@ def train(cfg):
 
     # this chunk has a complicate logic but it simply loads pre-trained ckpt during finetuning/resuming
     if cfg.training.run_test_only or cfg.training.resume or cfg.training.finetune:
-        start_epoch, early_stopper.best_metric = load_ckpt(cfg, model_without_ddp, optimizer, scaler, lr_scheduler)
+        start_epoch, early_stopper.best_metric, model_only_params = load_ckpt(cfg, model_without_ddp, optimizer, scaler, lr_scheduler)
     else:
         start_epoch = 0
 
@@ -60,13 +64,13 @@ def train(cfg):
     # loop over the train and validation multiple times (typical PT boilerplate)
     for epoch in range(start_epoch, num_epochs):
 
-        phases_to_run_on = ['train', 'valid']
+        phases_to_run_on = ['valid', 'train']
         if 'run_corrupted_val' not in cfg.training or cfg.training.run_corrupted_val:
             phases_to_run_on.extend(['valid_rand_aud', 'valid_rand_rgb', 'valid_perm_batch'])
 
         for phase in phases_to_run_on:
             # does model.eval() or .train() on appropriate submodules
-            toggle_mode(cfg, model, phase)
+            toggle_mode(cfg, model, phase, epoch, model_only_params)
 
             # init runnining results
             running_results = dict(logits=[], targets=[], loss_total=0)
@@ -85,8 +89,14 @@ def train(cfg):
                 prog_bar = tqdm(loaders[phase], f'{phase} ({epoch})', ncols=0)
                 for i, batch in enumerate(prog_bar):
                     # unfortunately, I had to use this to avoid GPU mem error on the second iteration
-                    if i == 1:
-                        torch.cuda.empty_cache()
+                    # if i == 0:
+                    #     torch.cuda.empty_cache()
+
+                    # Freeze weights on first epoch
+                    # Run valid before train
+                    # Run Valid every 200 or so steps
+                    # Add a valid-random phase for random offsets
+
                     iter_step = epoch * len(loaders[phase]) + i
                     # zero the parameter gradients
                     optimizer.zero_grad()
@@ -108,19 +118,39 @@ def train(cfg):
                             loss, logits = model(vid, aud, targets)
 
                     if phase == 'train':
-                        make_backward_and_optim_step(cfg, loss, model, optimizer, scaler, lr_scheduler)
+                        make_backward_and_optim_step(cfg, loss.mean(), model, optimizer, scaler, lr_scheduler)
 
                     # gathering results in one place to iterate on this later
                     iter_results = dict(
                         logits=[logits.detach().cpu()],
                         targets=[targets['offset_target'].cpu()],
-                        loss_total=loss.item(),
+                        # loss_total=loss.item(),
+                        loss_total=loss.mean(),
                     )
 
                     if is_master(global_rank):
                         verbose_iter_progress(logger, prog_bar, iter_step, iter_results, phase)
                         if phase == 'train':
                             verbose_lr(logger, prog_bar, iter_step, lr_scheduler.get_last_lr()[0])
+
+                            # if iter_step % 500 == 0:
+                            #     sub_running_results = dict(logits=[], targets=[], loss_total=0)
+                            #     for sub_valid_batch in tqdm(loaders['valid'], 'iter_valid ({epoch})',  ncols=0):
+                            #         sub_aud, sub_vid, sub_targets = prepare_inputs(sub_valid_batch, device, 'valid')
+                            #         with torch.set_grad_enabled(False):
+                            #             with torch.autocast('cuda', enabled=cfg.training.use_half_precision):
+                            #                 sub_loss, sub_logits = model(sub_vid, sub_aud, sub_targets)
+                            #         sub_iter_results = dict(
+                            #             logits=[sub_logits.detach().cpu()],
+                            #             targets=[sub_targets['offset_target'].cpu()],
+                            #             loss_total=sub_loss.item(),
+                            #         )
+                            #         for k in sub_running_results.keys():
+                            #             sub_running_results[k] += sub_iter_results[k]
+                            #     logger.log_iter_metrics(sub_running_results, epoch, 'valid-iter')
+
+
+
 
                     # doing it here instead of the dict() because we would like to verbose unscaled loss values
                     iter_results[f'loss_total'] /= len(loaders[phase])
@@ -160,7 +190,7 @@ def train(cfg):
     phase = 'test'
     cfg.training.finetune = False
     # loading the best model
-    ckpt_epoch, best_metric_val = load_ckpt(cfg, model_without_ddp, optimizer, scaler, lr_scheduler)
+    ckpt_epoch, best_metric_val, model_only_params = load_ckpt(cfg, model_without_ddp, optimizer, scaler, lr_scheduler)
     if is_master(global_rank):
         logger.print_logger.info(f'Loading the best model from {cfg.ckpt_path}')
         logger.print_logger.info(f'Best metric: {best_metric_val}')
@@ -188,11 +218,19 @@ def train(cfg):
                     loss, logits = model(vid, aud, targets)
 
             # gathering results in one place to iterate on this later
-            iter_results = dict(
-                logits=[logits.detach().cpu()],
-                targets=[targets['offset_target'].cpu()],
-                loss_total=loss.item() / len(loaders[phase]) / iter_times,
-            )
+            try:
+                iter_results = dict(
+                    logits=[logits.detach().cpu()],
+                    targets=[targets['offset_target'].cpu()],
+                    loss_total=loss.mean().item() / len(loaders[phase]) / iter_times,
+                )
+            except:
+                print('Failed!')
+                print('loss is', loss)
+                print('with .mean().item() we get', loss.mean().item())
+                print('loaders[phase] is', loaders[phase])
+                print('iter_times is', iter_times)
+                exit(0)
             for k in running_results.keys():
                 running_results[k] += iter_results[k]
 
