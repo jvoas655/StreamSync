@@ -16,8 +16,7 @@ class SparseSync(torch.nn.Module):
         self, vis_pos_emb_module, aud_pos_emb_module, num_offset_cls,
         visual_block_shape, audio_block_shape, pre_norm_cfg, v_selector_cfg, a_selector_cfg, mixed_selector_cfg, global_transformer_cfg,
         n_layer=12, n_head=8, n_embd=256, tok_pdrop=0., embd_pdrop=0., resid_pdrop=0., attn_pdrop=0.,
-        n_unmasked=0, selector_mixing=True, ablate_mixer=False, ablate_selector=False
-    ):
+        n_unmasked=0, selector_mixing=True, ablate_mixer=False, ablate_selector=False, cascade_selection=False):
         super().__init__()
         self.config = Config(
             num_offset_cls=num_offset_cls, audio_block_shape=audio_block_shape,
@@ -35,6 +34,8 @@ class SparseSync(torch.nn.Module):
         # selector transformers
         self.v_selector = instantiate_from_config(v_selector_cfg)  # FeatureSelectorTransformer
         self.a_selector = instantiate_from_config(a_selector_cfg)  # FeatureSelectorTransformer
+
+        self.cascade_selection = cascade_selection
 
         # Add the Selector Mixing Transformer Here
         self.selector_mixing = selector_mixing
@@ -62,13 +63,21 @@ class SparseSync(torch.nn.Module):
         vis, aud = self.pre_lnorm_vis(vis), self.pre_lnorm_aud(aud)
         # apply individual pos embeddings
         vis_context, aud_context = self.vis_pos_emb(vis), self.aud_pos_emb(aud)
-        
-        if return_attn_weights:
-            vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)
-            aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights)
+       
+        if self.cascade_selection:
+            if return_attn_weights:
+                vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)
+                aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights, extra_selectors=vis)
+            else:
+                vis = self.v_selector(vis_context)
+                aud = self.a_selector(aud_context, extra_selectors=vis)
         else:
-            # narrow down the dimension with selectors
-            vis, aud = self.v_selector(vis_context), self.a_selector(aud_context)
+            if return_attn_weights:
+                vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)
+                aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights)
+            else:
+                # narrow down the dimension with selectors
+                vis, aud = self.v_selector(vis_context), self.a_selector(aud_context)
 
         # mix selectors
         if self.selector_mixing:
@@ -144,7 +153,7 @@ class FeatureSelectorTransformer(torch.nn.Module):
         self.apply(init_weights)
         logger.info(f'Selector has {num_selectors} selectors')
 
-    def forward(self, context, selectors=None, return_attn_weights=False):
+    def forward(self, context, selectors=None, return_attn_weights=False, extra_selectors=None):
         '''takes in a set of features (context): (B, Tv, H, W, Dv) or (B, F, Ta, Da)'''
         B, D = context.shape[0], context.shape[-1]
         # (B, T, D) <= flattening the context
@@ -158,6 +167,10 @@ class FeatureSelectorTransformer(torch.nn.Module):
 
         # maybe add pos emb
         selectors = selectors if self.pos_emb_cfg is None else self.selectors_pos_emb(selectors)
+        
+        if extra_selectors is not None:
+            selectors = torch.cat((selectors, extra_selectors),dim=1)
+            
         # dropout
         selectors, context = self.selectors_drop(selectors), self.context_drop(context)
         

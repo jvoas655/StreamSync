@@ -47,19 +47,12 @@ class SportsAndNews(torch.utils.data.Dataset):
         self.size_ratio = size_ratio # used to do curriculum learning
         self.distribution_type = distribution_type
 
-<<<<<<< HEAD
-        if split == 'test' or split == 'train': # TODO: Existing code only supports evaluation on the "test" split; using our val split for that, but will need to refactor if we want to do both using their code
-            data_csv = open('data/sports_and_news_normal.evaluation.csv').readlines()
-            offset_path = 'data/sports_and_news_normal.evaluation.json'
-            skip_ids = [line.strip() for line in open('data/sports_and_news_normal.evaluation.skip_id_list.txt')]
-=======
         if split == 'test': # TODO: Existing code only supports evaluation on the "test" split; using our val split for that, but will need to refactor if we want to do both using their code
             data_csv = open(f'data/sports_and_news_{distribution_type}.evaluation.csv').readlines()
             offset_path = f'data/sports_and_news_{distribution_type}.evaluation.json'
             # skip_ids = [line.strip() for line in open(f'data/sports_and_news_{distribution_type}.{split}.skip_id_list.txt')]
             # skip_ids = [line.strip() for line in open('data/sports_and_news_normal.evaluation.skip_id_list.txt')]
             self.lengths_dict = json.load(open('/saltpool0/data/datasets/avsync/data/v5/evaluation_set_track_lengths.json'))
->>>>>>> 2be22d824aac6302eed644c1a4827cb8563e1847
         elif split == 'train':
             data_csv = open(f'data/sports_and_news_{distribution_type}.train.csv').readlines() # TODO: switch back to train after running tests
             offset_path = f'data/sports_and_news_{distribution_type}.train.json' # TODO: switch back to train after running tests
@@ -102,8 +95,8 @@ class SportsAndNews(torch.utils.data.Dataset):
                 assert(len(file_name_chunks) >= 5)
                 file_stem = '_'.join(file_name_chunks[:-2])
                 video_folder = '_'.join(file_name_chunks[:-4])
-                # full_path = '/data3/scratch/videos_at_25fps-encode_script/' + video_folder + '/' + file_stem + '.mkv'
-                full_path = '/saltpool0/data/datasets/avsync/data/v5/videos_at_25fps-encode_script/rOn7uGVVf1I/rOn7uGVVf1I_3000_3300.mkv'
+                full_path = '/data/scratch/layneberry/avsync_videos/' + video_folder + '/' + file_stem + '.mkv'
+                # full_path = '/saltpool0/data/datasets/avsync/data/v5/videos_at_25fps-encode_script/rOn7uGVVf1I/rOn7uGVVf1I_3000_3300.mkv'
                 video_id = line.split(',')[0]
                 tup = (video_id, full_path, float(line.split(',')[1]))
                 clip_paths.append(tup)
