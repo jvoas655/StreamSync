@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
+import pickle as pkl
 from utils.logger import LoggerWithTBoard
 
 from scripts.train_utils import (EarlyStopper, apply_batch_mixup,
@@ -231,18 +232,21 @@ def train(cfg):
                             new_attn_dict['aud_self_attn_2'] = asa2
                             new_attn_dict['vis_cross_attn_2'] = vca2
                             new_attn_dict['aud_cross_attn_2'] = aca2
-                        new_attn_dict['loss'] = loss
-                        new_attn_dict['logits'] = logits
+                        new_attn_dict['loss'] = loss.detach().cpu()
+                        new_attn_dict['logits'] = logits.detach().cpu()
                         new_attn_dict['vis_self_attn_1'] = vsa1
                         new_attn_dict['aud_self_attn_1'] = asa1
                         new_attn_dict['vis_cross_attn_1'] = vca1
                         new_attn_dict['aud_cross_attn_1'] = aca1
                         for k in new_attn_dict.keys():
-                            new_attn_dict[k].detach().cpu() # Don't require GPU to open
+                            if 'attn' in k:
+                                for l in range(len(new_attn_dict[k])):
+                                    new_attn_dict[k][l].detach().cpu()
                         all_dumped_attns.append(new_attn_dict)
                     else:
                         loss, logits = model(vid, aud, targets)
 
+            pkl.dump(all_dumped_attns, open('dumped_attention_weights.pkl','wb'))
             # gathering results in one place to iterate on this later
             try:
                 iter_results = dict(

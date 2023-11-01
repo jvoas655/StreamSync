@@ -46,7 +46,7 @@ model:
         attn_pdrop: 0.1
         ablate_mixer: True
         ablate_selector: True
-        cascade_selection: False
+        cascade_selection: 0 # 0 - None; 1 - Video First; 2 - Audio First
         vis_pos_emb_module:
           target: model.modules.transformer.PositionEmbeddingLearnedVisual
           params:
@@ -116,8 +116,8 @@ model:
 training:
   freeze_first: 0
   base_learning_rate: 1e-4
-  base_batch_size: 64
-  num_workers: 16
+  base_batch_size: 4
+  num_workers: 1
   num_epochs: 10000
   patience: 140
   to_max_metric: True
@@ -129,6 +129,7 @@ training:
   run_test_only: False
   resume: False
   finetune: True
+  dump_attn_weights: False
   detect_anomaly: False
   dist_backend: 'nccl'
   max_clip_norm: 1
@@ -189,6 +190,7 @@ transform_sequence_train:
       do_offset: ${data.do_offset}
       grid_type: 'linspace' # uniform linspace
       grid_size: ${model.params.transformer.params.num_offset_cls}
+      smoothing: 0.1
   - target: dataset.transforms.RandomApplyColorDistortion
     params:
       p_color_jitter: ${data.p_color_jitter}
@@ -264,6 +266,7 @@ transform_sequence_test:
       do_offset: ${data.do_offset}
       grid_type: 'linspace' # uniform linspace
       grid_size: ${model.params.transformer.params.num_offset_cls}
+      smoothing: 0.1
   - target: dataset.transforms.FreezeFrames
     params:
       max_off_sec: ${data.max_off_sec}

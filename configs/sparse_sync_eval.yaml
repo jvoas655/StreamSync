@@ -44,8 +44,9 @@ model:
         embd_pdrop: 0.1
         resid_pdrop: 0.1
         attn_pdrop: 0.1
-        ablate_mixer: False
-        ablate_selector: False
+        ablate_mixer: True
+        ablate_selector: True
+        cascade_selection: False
         vis_pos_emb_module:
           target: model.modules.transformer.PositionEmbeddingLearnedVisual
           params:
@@ -87,6 +88,19 @@ model:
             ablate_mixer: ${model.params.transformer.params.ablate_mixer}
             ablate_selector: ${model.params.transformer.params.ablate_selector}
             pos_emb_cfg: ${model.params.transformer.params.a_selector_cfg.params.pos_emb_cfg}
+        mixed_selector_cfg:
+          target: model.modules.feature_selector.FeatureSelectorTransformer
+          params:
+            num_selectors: ${model.params.transformer.params.a_selector_cfg.params.num_selectors}
+            n_layer: 1 # Reduce the number of additional parameters selector mixing adds
+            n_head: ${model.params.transformer.params.n_head}
+            n_embd: ${model.params.transformer.params.n_embd}
+            embd_pdrop: ${model.params.transformer.params.embd_pdrop}
+            resid_pdrop: ${model.params.transformer.params.resid_pdrop}
+            attn_pdrop: ${model.params.transformer.params.attn_pdrop}
+            ablate_mixer: ${model.params.transformer.params.ablate_mixer}
+            ablate_selector: ${model.params.transformer.params.ablate_selector}
+            pos_emb_cfg: ${model.params.transformer.params.a_selector_cfg.params.pos_emb_cfg}
         global_transformer_cfg:
           # target: model.modules.feature_selector.GlobalMLP
           target: model.modules.feature_selector.GlobalTransformer
@@ -100,9 +114,10 @@ model:
             attn_pdrop: ${model.params.transformer.params.attn_pdrop}
 
 training:
-  base_learning_rate: 5e-5
+  freeze_first: 0
+  base_learning_rate: 1e-4
   base_batch_size: 64
-  num_workers: 8
+  num_workers: 16
   num_epochs: 10000
   patience: 140
   to_max_metric: True
@@ -114,15 +129,16 @@ training:
   run_test_only: True
   resume: False
   finetune: False
+  dump_attn_weights: True
   detect_anomaly: False
   dist_backend: 'nccl'
   max_clip_norm: 1
   run_corrupted_val: False
   lr_scheduler:
     name: 'warmup_constant_decay' # 'constant_with_warmup'  # 'constant' 'constant_with_warmup'
-    warmup: 5000 # iterations to recover from base_learning_rate / 100
-    constant: 15000
-    remaining: 25000
+    warmup: 2000 # iterations to recover from base_learning_rate / 100
+    constant: 10000
+    remaining: 28000
   optimizer:
     name: adam # adamw, adam or sgd
     betas: [0.9, 0.999]
@@ -132,7 +148,7 @@ training:
 data:
   crop_len_sec: 5
   max_off_sec: 2
-  vids_path: '/data3/scratch/videos_at_25_fps-encode_script/' # 'PLACEHOLDER' # something that ends with 'CODEC_video_XXfps_YYYside_ZZZZZhz' or '..._25fps_...'
+  vids_path: '/data/scratch/layneberry/avsync_videos/videos_at_25_fps-encode_script/' # 'PLACEHOLDER' # something that ends with 'CODEC_video_XXfps_YYYside_ZZZZZhz' or '..._25fps_...'
   size_before_crop: 256  # video resolution -> size_before_crop resolution -> input_size (crop resolution)
   input_size: 224
   do_offset: True
@@ -276,12 +292,12 @@ transform_sequence_test:
       dim: 0
 
 logging:
-  logdir: './logs/sync_models'
+  logdir: '/saltpool0/scratch/layneberry/sync_models/'
   log_code_state: False
   # patterns to ignore when backing up the code folder
   patterns_to_ignore: ['logs', '.git', '__pycache__', 'data', '*.pt', 'sbatch_logs', '*.mp4', '*.wav', '*.jpg', '*.gif']
   use_wandb: False
 
 resume_scheduler_opt_scaler: False
-# ckpt_path: ./logs/sync_models/22-07-28T15-49-45/22-07-28T15-49-45.pt
-ckpt_path: ./logs/sync_models/23-09-18T11-54-10/23-09-18T11-54-10.pt
+ckpt_path: ./logs/sync_models/22-07-28T15-49-45/22-07-28T15-49-45.pt
+# ckpt_path: ./logs/sync_models/23-05-09T01-14-10/23-05-09T01-14-10.pt

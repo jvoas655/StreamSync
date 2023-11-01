@@ -16,7 +16,7 @@ class SparseSync(torch.nn.Module):
         self, vis_pos_emb_module, aud_pos_emb_module, num_offset_cls,
         visual_block_shape, audio_block_shape, pre_norm_cfg, v_selector_cfg, a_selector_cfg, mixed_selector_cfg, global_transformer_cfg,
         n_layer=12, n_head=8, n_embd=256, tok_pdrop=0., embd_pdrop=0., resid_pdrop=0., attn_pdrop=0.,
-        n_unmasked=0, selector_mixing=True, ablate_mixer=False, ablate_selector=False, cascade_selection=False):
+        n_unmasked=0, ablate_mixer=False, ablate_selector=False, cascade_selection=0):
         super().__init__()
         self.config = Config(
             num_offset_cls=num_offset_cls, audio_block_shape=audio_block_shape,
@@ -38,7 +38,7 @@ class SparseSync(torch.nn.Module):
         self.cascade_selection = cascade_selection
 
         # Add the Selector Mixing Transformer Here
-        self.selector_mixing = selector_mixing
+        self.selector_mixing = not (ablate_mixer and ablate_selector)
         if self.selector_mixing:
             self.va_selector_mixer = FeatureSelectorMixingTransformer(self.v_selector.num_selectors, self.a_selector.num_selectors, mixed_selector_cfg, n_embd, n_head)
 
@@ -64,13 +64,20 @@ class SparseSync(torch.nn.Module):
         # apply individual pos embeddings
         vis_context, aud_context = self.vis_pos_emb(vis), self.aud_pos_emb(aud)
        
-        if self.cascade_selection:
+        if self.cascade_selection == 1:
             if return_attn_weights:
                 vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)
                 aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights, extra_selectors=vis)
             else:
                 vis = self.v_selector(vis_context)
                 aud = self.a_selector(aud_context, extra_selectors=vis)
+        elif self.cascade_selection == 2:
+            if return_attn_weights:
+                aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights)
+                vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights, extra_selectors=aud)
+            else:
+                aud = self.a_selector(aud_context)
+                vis = self.v_selector(vis_context, extra_selectors=aud)
         else:
             if return_attn_weights:
                 vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)

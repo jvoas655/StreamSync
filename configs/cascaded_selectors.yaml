@@ -135,9 +135,9 @@ training:
   run_corrupted_val: False
   lr_scheduler:
     name: 'warmup_constant_decay' # 'constant_with_warmup'  # 'constant' 'constant_with_warmup'
-    warmup: 1000 # iterations to recover from base_learning_rate / 100
-    constant: 5000
-    remaining: 14000
+    warmup: 2000 # iterations to recover from base_learning_rate / 100
+    constant: 10000
+    remaining: 28000
   optimizer:
     name: adam # adamw, adam or sgd
     betas: [0.9, 0.999]
@@ -189,6 +189,7 @@ transform_sequence_train:
       do_offset: ${data.do_offset}
       grid_type: 'linspace' # uniform linspace
       grid_size: ${model.params.transformer.params.num_offset_cls}
+      smoothing: 0.1
   - target: dataset.transforms.RandomApplyColorDistortion
     params:
       p_color_jitter: ${data.p_color_jitter}
@@ -264,6 +265,7 @@ transform_sequence_test:
       do_offset: ${data.do_offset}
       grid_type: 'linspace' # uniform linspace
       grid_size: ${model.params.transformer.params.num_offset_cls}
+      smoothing: 0.1
   - target: dataset.transforms.FreezeFrames
     params:
       max_off_sec: ${data.max_off_sec}

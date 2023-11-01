@@ -407,7 +407,7 @@ def verbose_epoch_progress(global_rank, logger, running_results, phase, epoch):
         logger.log_epoch_loss(running_results['loss_total'], epoch, phase, prefix='total')
     # logging metrics
     logits = torch.cat(running_results['logits']).float()
-    targets = torch.cat(running_results['targets']).long()
+    targets = torch.cat(running_results['targets']).float()
     metrics = calc_metrics(targets, logits)
     if is_master(global_rank):
         logger.log_epoch_metrics(metrics, epoch, phase)
@@ -420,7 +420,7 @@ def verbose_test_progress(global_rank, logger, cfg, running_results, ckpt_epoch)
 
     if is_master(global_rank):
         logits = torch.cat(running_results['logits']).float()
-        targets = torch.cat(running_results['targets']).long()
+        targets = torch.cat(running_results['targets']).float()
         metrics = calc_metrics(targets, logits)
         metrics['loss'] = running_results['loss_total']
         logger.log_test_metrics(metrics, dict(cfg), ckpt_epoch)
@@ -469,7 +469,11 @@ def calc_metrics(targets, outputs: torch.FloatTensor, topk=(1, 5), only_accuracy
     _, preds = torch.topk(outputs, k=max(topk), dim=1)
 
     # accuracy@k
-    targets_for_acc = targets.view(-1, 1).expand_as(preds)
+    # print('targets', targets)
+    target_idxs = torch.max(targets, axis=-1).indices
+    # print('target idxs', target_idxs)
+    targets_for_acc = target_idxs.view(-1, 1).expand_as(preds)
+    # print('for acc', targets_for_acc)
     correct_for_maxtopk = preds == targets_for_acc
     for k in topk:
         TPs = correct_for_maxtopk[:, :k].sum()
@@ -493,8 +497,8 @@ def calc_metrics(targets, outputs: torch.FloatTensor, topk=(1, 5), only_accuracy
         return metrics_dict
 
     # avg precision, average roc_auc, and dprime
-    unique_targets = sorted(list(set(targets.tolist())))
-    targets = torch.nn.functional.one_hot(targets, num_classes=num_cls)
+    unique_targets = sorted(list(set(target_idxs.tolist())))
+    targets = torch.nn.functional.one_hot(target_idxs, num_classes=num_cls)
 
     # ids of the predicted classes (same as softmax)
     targets_pred = torch.softmax(outputs, dim=1)
@@ -508,7 +512,7 @@ def calc_metrics(targets, outputs: torch.FloatTensor, topk=(1, 5), only_accuracy
         roc_aucs = [roc_auc_score(targets[:, c], targets_pred[:, c], average=None) for c in range(num_cls)]
     except ValueError:
         logger.warning('Weird... Some classes never occured in targets. Do not trust the metrics.')
-        logger.warning(f'Here is the list of {prefix} target classes: {unique_targets}')
+        # logger.warning(f'Here is the list of {prefix} target classes: {unique_targets}')
         roc_aucs = np.array([0.5])
         avg_p = np.array([0])
 

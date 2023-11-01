@@ -261,7 +261,7 @@ class TemporalCropAndOffset(torch.nn.Module):
 class TemporalCropAndOffsetRandomFeasible(TemporalCropAndOffset):
 
     def __init__(self, crop_len_sec: float, max_off_sec: float, grid_type: str, way_to_do_trim: str = 'slice',
-                 do_offset: bool = True, grid_size: int = None, max_wiggle_sec: float = None):
+            do_offset: bool = True, grid_size: int = None, max_wiggle_sec: float = None, smoothing: float = 0.0):
         super().__init__(crop_len_sec, max_off_sec, do_offset, grid_size)
         # TODO: rename crop to trim if temporal crop is used
         self.max_a_jitter_sec = max_wiggle_sec
@@ -271,6 +271,7 @@ class TemporalCropAndOffsetRandomFeasible(TemporalCropAndOffset):
             if self.max_a_jitter_sec is not None:
                 assert max_wiggle_sec <= ((self.class_grid[1] - self.class_grid[0]) / 2), f'{self.class_grid}'
         self.grid_type = grid_type
+        self.smoothing = smoothing
 
     def apply_a_jitter(self, a_start_i, max_a_start_i, a_fps):
         max_a_jitter_i = sec2frames(self.max_a_jitter_sec, a_fps)  # not in self, as a_fps may be dynamic
@@ -379,10 +380,29 @@ class TemporalCropAndOffsetRandomFeasible(TemporalCropAndOffset):
         # caching parameters
         if self.do_offset:
             offset_label, offset_target = quantize_offset(self.class_grid, offset_sec)
+            if self.smoothing > 0.0:
+                # Convert target from index to probability distribution with some weight on neighboring classes
+                # print('original offset target', offset_target)
+                one_hot_offset = torch.nn.functional.one_hot(offset_target, num_classes=21).float()
+                # print('without smoothing', one_hot_offset)
+                if offset_target == 0:
+                    one_hot_offset[offset_target] -= self.smoothing
+                    one_hot_offset[offset_target + 1] += self.smoothing
+                elif offset_target == 20:
+                    one_hot_offset[offset_target] -= self.smoothing
+                    one_hot_offset[offset_target - 1] += self.smoothing
+                else:
+                    one_hot_offset[offset_target - 1] += self.smoothing
+                    one_hot_offset[offset_target] -= 2 * self.smoothing
+                    one_hot_offset[offset_target + 1] += self.smoothing
+                # print('with smoothing', one_hot_offset)
+                item['targets']['offset_target'] = one_hot_offset
+            else:
+                # print('not smoothing because', self.smoothing, 'is 0.0')
+                item['targets']['offset_target'] = offset_target
             item['targets']['offset_sec'] = offset_sec
             item['targets']['v_start_i_sec'] = v_start_i_sec
             item['targets']['offset_label'] = offset_label
-            item['targets']['offset_target'] = offset_target
 
         return item
 
