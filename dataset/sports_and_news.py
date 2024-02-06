@@ -10,6 +10,7 @@ from tqdm import tqdm
 import torch
 import json
 import time
+import s3fs
 
 sys.path.insert(0, '.')
 # was dataset.data_utils
@@ -29,7 +30,8 @@ class SportsAndNews(torch.utils.data.Dataset):
                  vis_load_backend=None, # This doesn't appear to be used anywhere, so can be empty
                  size_ratio=None,
                  channel=None, # None indicates use all channels
-                 distribution_type = 'uniform'):
+                 distribution_type = 'uniform',
+                 data_cfg = None):
         super().__init__()
         self.max_clip_len_sec = 5 # VGGSound has None, LRS has 11
         logger.info(f'During IO, the length of clips is limited to {self.max_clip_len_sec} sec')
@@ -46,32 +48,41 @@ class SportsAndNews(torch.utils.data.Dataset):
         self.vis_load_backend = vis_load_backend
         self.size_ratio = size_ratio # used to do curriculum learning
         self.distribution_type = distribution_type
-
+        self.data_cfg = data_cfg
+        if (hasattr(self.data_cfg, "streaming")):
+            self.streaming_cfg = self.data_cfg.streaming
+        else:
+            self.streaming_cfg = None
+        fs = s3fs.S3FileSystem()
         if split == 'test': # TODO: Existing code only supports evaluation on the "test" split; using our val split for that, but will need to refactor if we want to do both using their code
             data_csv = open(f'data/sports_and_news_{distribution_type}.evaluation.csv').readlines()
             offset_path = f'data/sports_and_news_{distribution_type}.evaluation.json'
             # skip_ids = [line.strip() for line in open(f'data/sports_and_news_{distribution_type}.{split}.skip_id_list.txt')]
             # skip_ids = [line.strip() for line in open('data/sports_and_news_normal.evaluation.skip_id_list.txt')]
-            self.lengths_dict = json.load(open('/saltpool0/data/datasets/avsync/data/v5/evaluation_set_track_lengths.json'))
+            self.lengths_dict = json.load(fs.open('s3://avsync-dataset-v5/all_clean_track_lengths_cropped.json'))
         elif split == 'train':
             data_csv = open(f'data/sports_and_news_{distribution_type}.train.csv').readlines() # TODO: switch back to train after running tests
             offset_path = f'data/sports_and_news_{distribution_type}.train.json' # TODO: switch back to train after running tests
             # skip_ids = [line.strip() for line in open(f'data/sports_and_news_{distribution_type}.{split}.skip_id_list.txt')]
-            self.lengths_dict = json.load(open('/saltpool0/data/datasets/avsync/data/v5/train_set_track_lengths.json'))
+            self.lengths_dict = json.load(fs.open('s3://avsync-dataset-v5/all_clean_track_lengths_cropped.json'))
         elif split in ('valid', 'valid-random'):
             data_csv = open(f'data/sports_and_news_{distribution_type}.test.csv').readlines()
             offset_path = f'data/sports_and_news_{distribution_type}.test.json'
             # skip_ids = [line.strip() for line in open(f'data/sports_and_news_{distribution_type}.{split}.skip_id_list.txt')]
-            self.lengths_dict = json.load(open('/saltpool0/data/datasets/avsync/data/v5/test_set_track_lengths.json'))
+            self.lengths_dict = json.load(fs.open('s3://avsync-dataset-v5/all_clean_track_lengths_cropped.json'))
         else:
             self.dataset = [0]
             return # Not set up yet!
         clip_paths = []
-
+        if (self.split == "train"):
+            data_csv = data_csv
+        else:
+            random.seed(self.seed)
+            random.shuffle(data_csv)
+            data_csv = data_csv[:2000]
         # broken_vids = skip_ids #'bcdWbE64hDE_900_1200', 'alY7_M_ibR4_900_1200']
         broken_vids = [line.strip() for line in open(f"sports_and_news_{distribution_type}.{self.split}.skip_id_list.txt", "r")]
-
-        for line in data_csv:
+        for line in tqdm(data_csv, total=len(data_csv)):
             skip = 'broken' in line
             if channel != None:
                 if channel not in line:
@@ -95,8 +106,8 @@ class SportsAndNews(torch.utils.data.Dataset):
                 assert(len(file_name_chunks) >= 5)
                 file_stem = '_'.join(file_name_chunks[:-2])
                 video_folder = '_'.join(file_name_chunks[:-4])
-                full_path = '/data/scratch/layneberry/avsync_videos/' + video_folder + '/' + file_stem + '.mkv'
-                # full_path = '/saltpool0/data/datasets/avsync/data/v5/videos_at_25fps-encode_script/rOn7uGVVf1I/rOn7uGVVf1I_3000_3300.mkv'
+                full_path = 's3://avsync-dataset-v5/cropped_videos_at_25fps/' + video_folder + '/' + file_stem + '.mkv'
+                #full_path = '/saltpool0/data/datasets/avsync/data/v5/videos_at_25fps-encode_script/rOn7uGVVf1I/rOn7uGVVf1I_3000_3300.mkv'
                 video_id = line.split(',')[0]
                 tup = (video_id, full_path, float(line.split(',')[1]))
                 clip_paths.append(tup)
@@ -150,18 +161,23 @@ class SportsAndNews(torch.utils.data.Dataset):
                 # Nearly all failures are from the video having only 7-9s of frames when the start time is 10s for some reason
                 start += 5
             """
+            if (self.streaming_cfg is not None and (self.streaming_cfg.enabled or self.split != "train")):
+                load_clip_length = self.max_clip_len_sec + (self.streaming_cfg.streaming_hop + self.streaming_cfg.streaming_hop_variance) * self.streaming_cfg.max_streaming_frames
+            else:
+                load_clip_length = self.max_clip_len_sec
             start_load = time.time()
-            rgb, audio, meta = get_video_and_audio(path, get_meta=True, max_clip_len_sec=self.max_clip_len_sec, start_sec=start)
+            rgb, audio, meta = get_video_and_audio(path, get_meta=True, max_clip_len_sec=load_clip_length, start_sec=start, loading_shift = self.data_cfg.loading_shift, loading_buffer=self.data_cfg.loading_buffer)
             end_load = time.time()
             load_time = end_load - start_load
-            if load_time > 5:
+            if load_time > 20:
                 print(path, 'took', load_time, 'seconds to load')
-                self.too_long_paths.append(path)
+                #self.too_long_paths.append(path)
             if rgb == None:
                 # print('get_video_and_audio failed for path', path, 'max_clip_len_sec', self.max_clip_len_sec, 'and start_sec', start, 'so retrieving prior example')
                 return self[index-1]
     
             # print('got response with shapes', rgb.shape, audio.shape, 'for path', path)
+            
 
             # (Tv, 3, H, W) in [0, 225], (Ta, C) in [-1, 1]
             item = {
@@ -173,7 +189,7 @@ class SportsAndNews(torch.utils.data.Dataset):
                 'split': self.split,
                 'start':start,
            }
-
+            
             start_transforms = time.time()
             # loading the fixed offsets. COMMENT THIS IF YOU DON'T HAVE A FILE YET
             if self.load_fixed_offsets_on_test and self.split in ['valid', 'test'] and not self.use_random_offset:
@@ -202,13 +218,14 @@ class SportsAndNews(torch.utils.data.Dataset):
                 # Old start time was (random.random()*296) + 2 to get range(2,298)
                 # New restricts to (2,actual_min_track_length-2)
                 # Also wait a second -- shouldn't we be loading the clip after this? Since we only load 5s? And this selects within the full 300s?
+                
                 item['targets']['v_start_i_sec'] = start # (random.random()*296) + 2 # random start time (2,298)
                 if self.transforms is not None:
                     try:
                         item = self.transforms(item)
                     except:
                         print(f"Failed id: {video_id}\nOffset: {item['targets']['offset_sec']}, Start: {item['targets']['v_start_i_sec']}")
-                        print('item is', item)
+                    #    #print('item is', item)
                         print('video shape is', item['video'].shape)
                         print('audio shape is', item['audio'].shape)
                         print('Applying transforms to get an error message, then exiting')
@@ -217,7 +234,24 @@ class SportsAndNews(torch.utils.data.Dataset):
                         return self[index-1] # Just retrain on previous data
             end_transforms = time.time()
             transforms_time = end_transforms - start_transforms
-
+            if (self.streaming_cfg is not None and (self.streaming_cfg.enabled or self.split != "train")):
+                audio_segments = []
+                video_segments = []
+                next_sec = 0
+                for iter in range(self.streaming_cfg.max_streaming_frames):
+                    if (len(audio_segments) == 0):
+                        audio_segments.append(item['audio'][:, :, int(next_sec * meta['audio']['framerate'][0] / 128): int((next_sec + self.max_clip_len_sec) * meta['audio']['framerate'][0] / 128)].unsqueeze(0))
+                        video_segments.append(item['video'][int(next_sec * meta['video']['fps'][0]): int((next_sec + self.max_clip_len_sec) * meta['video']['fps'][0])].unsqueeze(0))
+                    else:
+                        audio_segments.append(item['audio'][:, :, int(next_sec * meta['audio']['framerate'][0] / 128): int(next_sec * meta['audio']['framerate'][0] / 128) + audio_segments[-1].shape[-1]].unsqueeze(0))
+                        video_segments.append(item['video'][int(next_sec * meta['video']['fps'][0]): int(next_sec * meta['video']['fps'][0]) + video_segments[-1].shape[1]].unsqueeze(0))
+                    if (self.split == "train"):
+                        next_sec += self.streaming_cfg.streaming_hop + 2.0 * (random.random() - 0.5) * self.streaming_cfg.streaming_hop_variance
+                    else:
+                        next_sec += self.streaming_cfg.streaming_hop
+                item['video'] = torch.cat(video_segments, dim=0)
+                item['audio'] = torch.cat(audio_segments, dim=0)
+            
             # Decrease sizes
             item['video'] = item['video'].half()
             item['audio'] = item['audio'].half()

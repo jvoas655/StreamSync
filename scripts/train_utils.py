@@ -5,6 +5,7 @@ import random
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Dict
 
 import scipy
 import numpy as np
@@ -30,12 +31,12 @@ def set_seed(seed: int):
 
 def init_ddp(cfg):
     local_rank = os.environ.get('LOCAL_RANK')
-
+    world_size = os.environ.get("WORLD_SIZE")
     if local_rank is not None:
         print(f'WORLDSIZE {os.environ.get("WORLD_SIZE")} - RANK {local_rank}')
         print('HOST:', os.environ.get('HOSTNAME'),
               'MASTER:', os.environ.get('MASTER_ADDR'), ':', os.environ.get('MASTER_PORT'))
-        dist.init_process_group(cfg.training.dist_backend, timeout=timedelta(0, 600))
+        dist.init_process_group(cfg.training.dist_backend, world_size=int(world_size), timeout=timedelta(0, 600))
         cfg.training.local_rank = int(os.environ['LOCAL_RANK'])
         cfg.training.global_rank = int(os.environ['RANK'])
         cfg.training.world_size = dist.get_world_size()
@@ -87,27 +88,34 @@ def get_datasets(cfg, transforms):
     vis_load_backend = cfg.data.dataset.params.vis_load_backend
     size_ratio = cfg.data.dataset.params.size_ratio
     vids_path = cfg.data.vids_path
+    data_cfg = cfg.data
     return {
         'train': DatasetClass('train', vids_path, transforms['train'],
                               load_fixed_offsets_on_test=load_fixed_offsets_on_test,
-                              vis_load_backend=vis_load_backend, size_ratio=size_ratio),
+                              vis_load_backend=vis_load_backend, size_ratio=size_ratio, 
+                              data_cfg=data_cfg),
         'valid': DatasetClass('valid', vids_path, transforms['test'],
                               load_fixed_offsets_on_test=load_fixed_offsets_on_test,
-                              vis_load_backend=vis_load_backend, size_ratio=size_ratio),
+                              vis_load_backend=vis_load_backend, size_ratio=size_ratio, 
+                              data_cfg=data_cfg),
         'valid-random': DatasetClass('valid-random', vids_path, transforms['test'],
                               load_fixed_offsets_on_test=load_fixed_offsets_on_test,
-                              vis_load_backend=vis_load_backend, size_ratio=size_ratio),
+                              vis_load_backend=vis_load_backend, size_ratio=size_ratio, 
+                              data_cfg=data_cfg),
         'test': DatasetClass('test', vids_path, transforms['test'],
                              load_fixed_offsets_on_test=load_fixed_offsets_on_test,
-                             vis_load_backend=vis_load_backend),
+                             vis_load_backend=vis_load_backend, 
+                              data_cfg=data_cfg),
     }
 
 
 def get_batch_sizes(cfg, num_gpus):
     train_B = cfg.training.base_batch_size
+    eval_B = cfg.training.base_batch_size_eval
     return {
         'train': train_B,
-        'test': train_B,
+        'valid': eval_B,
+        'test': eval_B,
     }
 
 
@@ -127,22 +135,22 @@ def get_loaders(cfg, datasets, batch_sizes):
             datasets['train'], batch_sizes['train'], shuffle=train_sampler is None,
             sampler=train_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
         'valid': DataLoader(
-            datasets['valid'], batch_sizes['test'], shuffle=False,
+            datasets['valid'], batch_sizes['valid'], shuffle=False,
             sampler=valid_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
         'valid-random': DataLoader(
-            datasets['valid-random'], batch_sizes['test'], shuffle=False,
+            datasets['valid-random'], batch_sizes['valid'], shuffle=False,
             sampler=valid_random_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
         'test': DataLoader(
             datasets['test'], batch_sizes['test'], shuffle=False,
             sampler=test_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
         'valid_rand_aud': DataLoader(
-            val_subset, batch_sizes['test'], shuffle=False,
+            val_subset, batch_sizes['valid'], shuffle=False,
             sampler=valid_rand_aud_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
         'valid_rand_rgb': DataLoader(
-            val_subset, batch_sizes['test'], shuffle=False,
+            val_subset, batch_sizes['valid'], shuffle=False,
             sampler=valid_rand_rgb_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
         'valid_perm_batch': DataLoader(
-            val_subset, batch_sizes['test'], shuffle=False,
+            val_subset, batch_sizes['valid'], shuffle=False,
             sampler=valid_perm_batch_sampler, num_workers=cfg.training.num_workers, pin_memory=True),
     }
 
@@ -162,9 +170,11 @@ def get_model(cfg, device):
     model_without_ddp = model
     if dist.is_initialized():
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[cfg.training.local_rank])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=True)
         # any mistaken calls on `model_without_ddp` (=None) will likely raise an error
         model_without_ddp = model.module
+    else:
+        model = torch.nn.DataParallel(model)
 
     return model, model_without_ddp
 
@@ -252,7 +262,7 @@ def load_ckpt(cfg, model_wo_ddp, optimizer, scaler, lr_scheduler):
     # a bit ugly but it patches checkpoints produced by the 'old' code
     metrics = ckpt['metrics']
     metrics = metrics.get('off', metrics)
-    return start_epoch, metrics[cfg.training.metric_name], model_only_params
+    return start_epoch, metrics, model_only_params
 
 
 class EarlyStopper(object):
@@ -294,6 +304,7 @@ class EarlyStopper(object):
 
 
 def toggle_mode(cfg, model, phase, epoch, model_only_params):
+    mode = -1
     if phase == 'train':
         model.train()
         if cfg.training.freeze_first > epoch: # Only freeze for the first few epochs
@@ -302,7 +313,8 @@ def toggle_mode(cfg, model, phase, epoch, model_only_params):
                     p.requires_grad = True # Parameters not loaded from the ckpt should be trained
                 else:
                     p.requires_grad = False # Parameters loaded from the ckpt are frozen
-        elif cfg.training.freeze_first == epoch:
+            mode = 1
+        elif cfg.training.freeze_first <= epoch:
             # First epoch back, so need to un-freeze everything
             for n,p in model.named_parameters():
                 p.requires_grad = True
@@ -321,6 +333,7 @@ def toggle_mode(cfg, model, phase, epoch, model_only_params):
                 else:
                     for params in model.afeat_extractor.parameters():
                         params.requires_grad = False
+            mode = 2
         if cfg.model.params.afeat_extractor.is_trainable is False:
             if dist.is_initialized():
                 model.module.afeat_extractor.eval()
@@ -333,6 +346,7 @@ def toggle_mode(cfg, model, phase, epoch, model_only_params):
                 model.vfeat_extractor.eval()
     else:
         model.eval()
+    return mode
 
 
 def prepare_inputs(batch, device, phase=None):
@@ -365,6 +379,28 @@ def apply_batch_mixup(x, alpha):
     else:
         return x
 
+def make_backward_step(cfg, loss, model, scaler, retain_graph=False):
+    # without half precision training:
+    # loss.backward()
+    # if cfg.get('max_clip_norm', None) is not None:
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_clip_norm)
+    # optimizer.step()
+    scaler.scale(loss).backward(retain_graph=retain_graph)
+
+def make_optim_step(cfg, model, optimizer, scaler, lr_scheduler):
+    # without half precision training:
+    # loss.backward()
+    # if cfg.get('max_clip_norm', None) is not None:
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_clip_norm)
+    # optimizer.step()
+    scaler.unscale_(optimizer)
+    max_clip_norm = cfg.training.get('max_clip_norm', None)
+    if max_clip_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_clip_norm)
+    scaler.step(optimizer)
+    scaler.update()
+    lr_scheduler.step()
+
 
 def make_backward_and_optim_step(cfg, loss, model, optimizer, scaler, lr_scheduler):
     # without half precision training:
@@ -384,7 +420,7 @@ def make_backward_and_optim_step(cfg, loss, model, optimizer, scaler, lr_schedul
 
 def verbose_iter_progress(logger, prog_bar, iter_step, iter_results, phase):
     # iter logging (making it a bit more sparse for faster tboard loading)
-    if iter_step % 200 == 0:
+    if iter_step % 100 == 0:
         iter_loss = iter_results['loss_total']
         if phase not in ['valid_rand_aud', 'valid_rand_rgb', 'valid_perm_batch']:
             logger.log_iter_loss(iter_loss, iter_step, phase, prefix='total')
@@ -392,23 +428,25 @@ def verbose_iter_progress(logger, prog_bar, iter_step, iter_results, phase):
         prog_bar.set_postfix(loss=iter_results['loss_total'])
 
 
-def verbose_lr(logger, prog_bar, iter_step, lr):
-    # report each iteration before 1000 just to avoid too much verbosing
-    if max(1000, iter_step) % 100 == 0:
+def verbose_log(logger, prog_bar, iter_step, lr, loss):
+    if (iter_step % 4 == 0):
         logger.add_scalar('lr', lr, iter_step)
-        # tracks loss in the tqdm progress bar
-        prog_bar.set_postfix(lr=lr)
+        logger.add_scalar('loss', loss, iter_step)
+    prog_bar.set_postfix(lr=lr, loss=loss)
 
 
 def verbose_epoch_progress(global_rank, logger, running_results, phase, epoch):
     running_results = gather_dict(running_results)
+    for key, value in running_results.items():
+        print(key, type(value))
     # logging loss values
     if is_master(global_rank):
         logger.log_epoch_loss(running_results['loss_total'], epoch, phase, prefix='total')
     # logging metrics
-    logits = torch.cat(running_results['logits']).float()
+    for key, value in running_results['logits'].items():
+        running_results['logits'][key] = torch.cat(value).float()
     targets = torch.cat(running_results['targets']).float()
-    metrics = calc_metrics(targets, logits)
+    metrics = calc_metrics(targets, running_results['logits'])
     if is_master(global_rank):
         logger.log_epoch_metrics(metrics, epoch, phase)
     epoch_loss = running_results['loss_total']
@@ -431,20 +469,26 @@ def gather_dict(dct):
     if dist.is_initialized():
         dist.barrier()
         for k, v in dct.items():
-            gather_buffer = [None for _ in range(dist.get_world_size())]
-            dist.all_gather_object(gather_buffer, v)
-            if isinstance(v, list):
-                # flattens a list of lists into one list
-                dct[k] = list(itertools.chain(*gather_buffer))
-            elif isinstance(v, float):
-                # average
-                dct[k] = sum(gather_buffer) / len(gather_buffer)
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    gather_buffer = [None for _ in range(dist.get_world_size())]
+                    dist.all_gather_object(gather_buffer, sub_v)
+                    dct[k][sub_k] = list(itertools.chain(*gather_buffer))
             else:
-                raise NotImplementedError(f'{type(v)}, \n{v}')
+                gather_buffer = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(gather_buffer, v)
+                if isinstance(v, list):
+                    # flattens a list of lists into one list
+                    dct[k] = list(itertools.chain(*gather_buffer))
+                elif isinstance(v, float):
+                    # average
+                    dct[k] = sum(gather_buffer) / len(gather_buffer)
+                else:
+                    raise NotImplementedError(f'{type(v)}, \n{v}')
     return dct
 
 
-def calc_metrics(targets, outputs: torch.FloatTensor, topk=(1, 5), only_accuracy=False, prefix=''):
+def calc_metrics(targets: torch.Tensor, outputs_dict: Dict[str, torch.FloatTensor], topk=(1, 5), only_accuracy=False, prefix=''):
     """
     Adapted from https://github.com/hche11/VGGSound/blob/master/utils.py
 
@@ -458,68 +502,69 @@ def calc_metrics(targets, outputs: torch.FloatTensor, topk=(1, 5), only_accuracy
     """
     prefix = fix_prefix(prefix)
     metrics_dict = dict()
+    targets_store = targets
+    for key, value in outputs_dict.items():
+        targets = targets_store
+        outputs = value
+        dataset_size, num_cls = outputs.shape
+        topk = [min(k, num_cls) for k in topk]
 
-    dataset_size, num_cls = outputs.shape
-    topk = [min(k, num_cls) for k in topk]
+        if np.isinf(outputs.numpy()).any() or not np.isfinite(outputs.numpy()).all():
+            outputs = torch.rand_like(outputs)
+            logger.warning('infinity or loss was nan. Replacing with random')
 
-    if np.isinf(outputs.numpy()).any() or not np.isfinite(outputs.numpy()).all():
-        outputs = torch.rand_like(outputs)
-        logger.warning('infinity or loss was nan. Replacing with random')
+        _, preds = torch.topk(outputs, k=max(topk), dim=1)
 
-    _, preds = torch.topk(outputs, k=max(topk), dim=1)
+        # accuracy@k
+        # print('targets', targets)
+        target_idxs = torch.max(targets, axis=-1).indices
+        # print('target idxs', target_idxs)
+        targets_for_acc = target_idxs.view(-1, 1).expand_as(preds)
+        # print('for acc', targets_for_acc)
+        correct_for_maxtopk = preds == targets_for_acc
+        for k in topk:
+            TPs = correct_for_maxtopk[:, :k].sum()
+            topk_accuracy = float(TPs / dataset_size)
+            metrics_dict[f'{prefix}accuracy_{k}_{key}'] = topk_accuracy
 
-    # accuracy@k
-    # print('targets', targets)
-    target_idxs = torch.max(targets, axis=-1).indices
-    # print('target idxs', target_idxs)
-    targets_for_acc = target_idxs.view(-1, 1).expand_as(preds)
-    # print('for acc', targets_for_acc)
-    correct_for_maxtopk = preds == targets_for_acc
-    for k in topk:
-        TPs = correct_for_maxtopk[:, :k].sum()
-        topk_accuracy = float(TPs / dataset_size)
-        metrics_dict[f'{prefix}accuracy_{k}'] = topk_accuracy
+        # accuracy@k_tol
+        if num_cls == 3 and dataset_size > 100:  # 100 is to avoid verbosity on iteration level
+            logger.warning('Accuracy with tolerance is not reliable as num of offset classes is 3.')
+        targets_for_acc_left_tol = (targets_for_acc - 1).clamp(0, num_cls-1)
+        targets_for_acc_right_tol = (targets_for_acc + 1).clamp(0, num_cls-1)
+        targets_for_acc_w_tol = torch.stack([targets_for_acc_left_tol, targets_for_acc, targets_for_acc_right_tol])
+        correct_for_maxtopk_w_tol = (preds == targets_for_acc_w_tol).any(dim=0)
+        for k in topk:
+            # tolerance might result in having more than one `True` per item. Preventing overcounting w/ `any()`
+            TPs_w_tol = correct_for_maxtopk_w_tol[:, :k].any(dim=1).sum()
+            topk_accuracy_w_tol = float(TPs_w_tol / dataset_size)
+            metrics_dict[f'{prefix}accuracy_{k}_tol1_{key}'] = topk_accuracy_w_tol
 
-    # accuracy@k_tol
-    if num_cls == 3 and dataset_size > 100:  # 100 is to avoid verbosity on iteration level
-        logger.warning('Accuracy with tolerance is not reliable as num of offset classes is 3.')
-    targets_for_acc_left_tol = (targets_for_acc - 1).clamp(0, num_cls-1)
-    targets_for_acc_right_tol = (targets_for_acc + 1).clamp(0, num_cls-1)
-    targets_for_acc_w_tol = torch.stack([targets_for_acc_left_tol, targets_for_acc, targets_for_acc_right_tol])
-    correct_for_maxtopk_w_tol = (preds == targets_for_acc_w_tol).any(dim=0)
-    for k in topk:
-        # tolerance might result in having more than one `True` per item. Preventing overcounting w/ `any()`
-        TPs_w_tol = correct_for_maxtopk_w_tol[:, :k].any(dim=1).sum()
-        topk_accuracy_w_tol = float(TPs_w_tol / dataset_size)
-        metrics_dict[f'{prefix}accuracy_{k}_tol1'] = topk_accuracy_w_tol
 
-    if only_accuracy:
-        return metrics_dict
+        # avg precision, average roc_auc, and dprime
+        unique_targets = sorted(list(set(target_idxs.tolist())))
+        targets = torch.nn.functional.one_hot(target_idxs, num_classes=num_cls)
 
-    # avg precision, average roc_auc, and dprime
-    unique_targets = sorted(list(set(target_idxs.tolist())))
-    targets = torch.nn.functional.one_hot(target_idxs, num_classes=num_cls)
+        # ids of the predicted classes (same as softmax)
+        targets_pred = torch.softmax(outputs, dim=1)
 
-    # ids of the predicted classes (same as softmax)
-    targets_pred = torch.softmax(outputs, dim=1)
+        targets = targets.numpy()
+        targets_pred = targets_pred.numpy()
 
-    targets = targets.numpy()
-    targets_pred = targets_pred.numpy()
+        # one-vs-rest
+        avg_p = [average_precision_score(targets[:, c], targets_pred[:, c], average=None) for c in range(num_cls)]
+        try:
+            roc_aucs = [roc_auc_score(targets[:, c], targets_pred[:, c], average=None) for c in range(num_cls)]
+        except ValueError:
+            logger.warning('Weird... Some classes never occured in targets. Do not trust the metrics.')
+            # logger.warning(f'Here is the list of {prefix} target classes: {unique_targets}')
+            roc_aucs = np.array([0.5])
+            avg_p = np.array([0])
 
-    # one-vs-rest
-    avg_p = [average_precision_score(targets[:, c], targets_pred[:, c], average=None) for c in range(num_cls)]
-    try:
-        roc_aucs = [roc_auc_score(targets[:, c], targets_pred[:, c], average=None) for c in range(num_cls)]
-    except ValueError:
-        logger.warning('Weird... Some classes never occured in targets. Do not trust the metrics.')
-        # logger.warning(f'Here is the list of {prefix} target classes: {unique_targets}')
-        roc_aucs = np.array([0.5])
-        avg_p = np.array([0])
-
-    metrics_dict[f'{prefix}mAP'] = np.mean(avg_p)
-    metrics_dict[f'{prefix}mROCAUC'] = np.mean(roc_aucs)
-    # Percent point function (ppf) (inverse of cdf — percentiles).
-    metrics_dict[f'{prefix}dprime'] = scipy.stats.norm().ppf(metrics_dict[f'{prefix}mROCAUC'])*np.sqrt(2)
+        metrics_dict[f'{prefix}mAP_{key}'] = np.mean(avg_p)
+        metrics_dict[f'{prefix}mROCAUC_{key}'] = np.mean(roc_aucs)
+        # Percent point function (ppf) (inverse of cdf — percentiles).
+        metrics_dict[f'{prefix}dprime_{key}'] = scipy.stats.norm().ppf(metrics_dict[f'{prefix}mROCAUC_{key}'])*np.sqrt(2)
 
     return metrics_dict
 

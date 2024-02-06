@@ -72,6 +72,53 @@ class EqualifyFromRight(torch.nn.Module):
         item['video'] = item['video'][:v_len_frames, :, :, :]
 
         return item
+    
+class EqualifyFromRightStreaming(torch.nn.Module):
+
+    def __init__(self, crop_len_sec, loading_shift, loading_buffer, streaming_enabled, streaming_hop, streaming_hop_variance, max_streaming_frames):
+        '''
+        Takes the dataset item and makes sure more streams are of an equal size in terms of fps.
+        It, however, assumes that the signal is synched and trims the ending parts ('from the right').
+        '''
+        super().__init__()
+        self.crop_len_sec = crop_len_sec
+        self.loading_shift = loading_shift
+        self.loading_buffer = loading_buffer
+        self.streaming_enabled = streaming_enabled
+        self.streaming_hop = streaming_hop
+        self.streaming_hop_variance = streaming_hop_variance
+        self.max_streaming_frames = max_streaming_frames
+
+    def forward(self, item):
+        '''
+        `item`: {'video': (Tv, C, H, W), 'audio': (Ta,),
+                 'meta': {
+                     'audio': {'framerate': [float], 'duration': [float]}
+                     'video': {'fps': [float], 'duration': [float]}}
+        '''
+        actual_clip_length_max = self.crop_len_sec + sum(self.loading_shift) + self.loading_buffer
+        if (self.streaming_enabled):
+            actual_clip_length_max += self.max_streaming_frames * (self.streaming_hop + self.streaming_hop_variance)
+        a_fps = item['meta']['audio']['framerate'][0]
+        v_fps = item['meta']['video']['fps'][0]
+
+        Ta = item['audio'].shape[0]
+        Tv, C, H, W = item['video'].shape
+
+        a_len_secs = Ta / a_fps
+        v_len_secs = Tv / v_fps
+        min_len = min(actual_clip_length_max, a_len_secs, v_len_secs)
+
+        a_frames_per_v_frame = a_fps // v_fps
+        v_len_frames = int(v_fps * min_len)
+        a_len_frames = int(a_frames_per_v_frame * v_len_frames)
+        # print(a_len_frames, v_len_frames)
+
+        assert a_len_frames <= Ta and v_len_frames <= Tv
+
+        item['audio'] = item['audio'][:a_len_frames]
+        item['video'] = item['video'][:v_len_frames, :, :, :]
+        return item
 
 
 class AudioResampleDynamic(torch.nn.Module):
@@ -405,6 +452,162 @@ class TemporalCropAndOffsetRandomFeasible(TemporalCropAndOffset):
             item['targets']['offset_label'] = offset_label
 
         return item
+    
+
+class TemporalCropAndOffsetRandomFeasibleStreaming(TemporalCropAndOffset):
+
+    def __init__(self, crop_len_sec: float, crop_streaming_frames: float, crop_streaming_frame_length: float, 
+            crop_streaming_frame_variance: float, max_off_sec: float, grid_type: str, way_to_do_trim: str = 'slice',
+            do_offset: bool = True, grid_size: int = None, max_wiggle_sec: float = None, smoothing: float = 0.0):
+        super().__init__(crop_len_sec, max_off_sec, do_offset, grid_size)
+        # TODO: rename crop to trim if temporal crop is used
+        self.crop_streaming_frames = crop_streaming_frames
+        self.crop_streaming_frame_length = crop_streaming_frame_length
+        self.crop_streaming_frame_variance = crop_streaming_frame_variance
+        self.max_a_jitter_sec = max_wiggle_sec
+        if do_offset:
+            self.class_grid = make_class_grid(-max_off_sec, max_off_sec, grid_size, grid_type)
+            logger.info(f'Offset class grid: {self.class_grid}')
+            if self.max_a_jitter_sec is not None:
+                assert max_wiggle_sec <= ((self.class_grid[1] - self.class_grid[0]) / 2), f'{self.class_grid}'
+        self.grid_type = grid_type
+        self.smoothing = smoothing
+
+    def apply_a_jitter(self, a_start_i, max_a_start_i, a_fps):
+        max_a_jitter_i = sec2frames(self.max_a_jitter_sec, a_fps)  # not in self, as a_fps may be dynamic
+        max_a_jitter_i_left = min(a_start_i, max_a_jitter_i)
+        max_a_jitter_i_right = min(max_a_start_i - a_start_i, max_a_jitter_i)
+        # jitter is U[left, right]
+        a_jitter_i = random.randint(-max_a_jitter_i_left, max_a_jitter_i_right)
+        # apply jitter
+        a_start_i = a_start_i + a_jitter_i
+        # making sure that any value from `a_start_i + U[left, right]` will be inside of [0, len-crop] region
+        assert 0 <= a_start_i <= max_a_start_i, f'{a_jitter_i} {max_a_jitter_i_left} {max_a_jitter_i_right} {max_a_start_i}'
+        return a_start_i, a_jitter_i
+
+
+    def forward(self, item): #, skip_start_offset=False):
+        vid = item['video']
+        aud = item['audio']
+        #print(2, item['audio'].shape, item['video'].shape)
+        v_len_frames, C, H, W = vid.shape
+        a_len_frames = aud.shape[0]
+
+        v_fps = int(item['meta']['video']['fps'][0])
+        a_fps = int(item['meta']['audio']['framerate'][0])
+
+        v_crop_len_frames = sec2frames(self.crop_len_sec + self.crop_streaming_frames * (self.crop_streaming_frame_length + self.crop_streaming_frame_variance), v_fps)
+        a_crop_len_frames = sec2frames(self.crop_len_sec + self.crop_streaming_frames * (self.crop_streaming_frame_length + self.crop_streaming_frame_variance), a_fps)
+
+        if self.do_offset:
+            # trying to get the offset parameters (for instance during valid and test we have fixed offsets)
+            offset_sec = item['targets'].get('offset_sec', None)
+            v_start_i_sec = item['targets'].get('v_start_i_sec', None)
+            # train-time
+            if offset_sec is None and v_start_i_sec is None:
+                # aud starts `offset_sec` earlier than it should; aud has what will be shown after offset_sec
+                offset_sec = random.choice(self.class_grid.tolist())
+                offset_sec = round(offset_sec, 2)
+                v_start_max_sec = frames2sec(v_len_frames - v_crop_len_frames, v_fps)
+                # `v_start_sec` IS NOT rounded to the fps grid
+                v_start_sec = random.uniform(max(0, -offset_sec), min(v_start_max_sec, v_start_max_sec-offset_sec))
+                v_start_i = sec2frames(v_start_sec, v_fps)
+                v_end_i = v_start_i + v_crop_len_frames
+                # `v_start_i_sec` IS rounded to the fps grid
+                v_start_i_sec = frames2sec(v_start_i, v_fps)
+                # `a_start_i` depends on the rounded value `v_start_i_sec`, otherwise
+                # (v_start_sec) we have ±0.1 jittering
+                a_start_i = sec2frames(v_start_i_sec + offset_sec, a_fps)
+                if self.max_a_jitter_sec is not None and self.max_a_jitter_sec > 0:
+                    max_a_start_i = a_len_frames - a_crop_len_frames
+                    a_start_i, a_jitter_i = self.apply_a_jitter(a_start_i, max_a_start_i, a_fps)
+                    item['meta']['a_jitter_i'] = a_jitter_i
+                a_end_i = a_start_i + a_crop_len_frames
+            else: #if skip_start_offset:
+                offset_sec = round(offset_sec, 2)
+                v_start_i = sec2frames(2, v_fps)
+                a_start_i = sec2frames(2+offset_sec, a_fps)
+                v_end_i = v_start_i + v_crop_len_frames
+                a_end_i = a_start_i + a_crop_len_frames
+            """
+            else:
+                offset_sec = round(offset_sec, 2)
+                v_start_i = sec2frames(v_start_i_sec, v_fps)
+                a_start_i = sec2frames(v_start_i_sec + offset_sec, a_fps)
+                v_end_i = v_start_i + v_crop_len_frames
+                a_end_i = a_start_i + a_crop_len_frames
+            """
+        else:
+            offset_sec = 0.0
+            is_random_crop = item['split'] == 'train'
+            v_start_i, v_end_i = self.get_crop_idx(v_len_frames, v_crop_len_frames, is_random=is_random_crop)
+            v_start_i_sec = frames2sec(v_start_i, v_fps)
+            a_start_i = sec2frames(v_start_i_sec, a_fps)
+            if self.max_a_jitter_sec is not None and self.max_a_jitter_sec > 0:
+                max_a_start_i = a_len_frames - a_crop_len_frames
+                a_start_i, a_jitter_i = self.apply_a_jitter(a_start_i, max_a_start_i, a_fps)
+                item['meta']['a_jitter_i'] = a_jitter_i
+            a_end_i = a_start_i + a_crop_len_frames
+
+        # sometimes due to the rounding error e.g. v_start_sec = 1.505 but sec2frames(1.505, 25) = 1.48
+        # given offset is -1.5, the a_start_i will be a small negative value. (likely a_fps * 1/v_fps * 0.5)
+        if a_start_i < 0:
+            how_much_out = a_start_i
+            logger.info(f'a_start_i is negative ({how_much_out}) at {item["path"]}')
+            if abs(how_much_out) <= a_fps / v_fps:
+                logger.info('fixing it')
+                a_start_i += abs(how_much_out)
+                a_end_i += abs(how_much_out)
+            else:
+                raise Exception(f'{how_much_out} {item["path"]}')
+
+        assert v_start_i < v_end_i and a_start_i < a_end_i
+        # assert aud.shape[0] >= a_end_i, f'{aud.shape} {a_end_i} {item["path"]} {item["start"]}'
+        # assert vid.shape[0] >= v_end_i, f'{vid.shape} {v_end_i} {item["path"]} {item["start"]}'
+        if aud.shape[0] < a_end_i or vid.shape[0] < v_end_i:
+            print('aud shape[0]', aud.shape[0], 'is less than a_end_i', a_end_i)
+            print('OR vid shape[0]', vid.shape[0], 'is less than v_end_i', v_end_i)
+            print('with a_start_i', a_start_i, 'and v_start_i', v_start_i)
+            raise Exception("Not enough samples or frames")
+
+        vid, aud = vid[v_start_i:v_end_i, :, :, :], aud[a_start_i:a_end_i]
+
+        item['video'] = vid
+        item['audio'] = aud
+        #print(3, aud.shape, a_start_i, a_end_i, a_crop_len_frames, vid.shape, v_start_i, v_end_i, v_crop_len_frames)
+        #print(v_fps * (self.crop_len_sec + self.crop_streaming_frames * (self.crop_streaming_frame_length + self.crop_streaming_frame_variance)))
+        assert item['video'].shape[0] == int(v_fps * (self.crop_len_sec + self.crop_streaming_frames * (self.crop_streaming_frame_length + self.crop_streaming_frame_variance + 1e-9))), f'{item["video"].shape} {item["path"]}'
+        assert item['audio'].shape[0] == int(a_fps * (self.crop_len_sec + self.crop_streaming_frames * (self.crop_streaming_frame_length + self.crop_streaming_frame_variance + 1e-9))), f'{item["audio"].shape} {item["path"]}'
+
+        # caching parameters
+        if self.do_offset:
+            offset_label, offset_target = quantize_offset(self.class_grid, offset_sec)
+            if self.smoothing > 0.0:
+                # Convert target from index to probability distribution with some weight on neighboring classes
+                # print('original offset target', offset_target)
+                one_hot_offset = torch.nn.functional.one_hot(offset_target, num_classes=21).float()
+                # print('without smoothing', one_hot_offset)
+                if offset_target == 0:
+                    one_hot_offset[offset_target] -= self.smoothing
+                    one_hot_offset[offset_target + 1] += self.smoothing
+                elif offset_target == 20:
+                    one_hot_offset[offset_target] -= self.smoothing
+                    one_hot_offset[offset_target - 1] += self.smoothing
+                else:
+                    one_hot_offset[offset_target - 1] += self.smoothing
+                    one_hot_offset[offset_target] -= 2 * self.smoothing
+                    one_hot_offset[offset_target + 1] += self.smoothing
+                # print('with smoothing', one_hot_offset)
+                item['targets']['offset_target'] = one_hot_offset
+            else:
+                # print('not smoothing because', self.smoothing, 'is 0.0')
+                item['targets']['offset_target'] = offset_target
+            item['targets']['offset_sec'] = offset_sec
+            item['targets']['v_start_i_sec'] = v_start_i_sec
+            item['targets']['offset_label'] = offset_label
+
+        return item
+
 
 
 class RGBToFloatToZeroOne(torch.nn.Module):

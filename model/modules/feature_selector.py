@@ -10,6 +10,113 @@ from model.modules.transformer import Block, Config, SelfAttention
 
 logger = logging.getLogger(f'main.{__name__}')
 
+class StreamingSparseSync(torch.nn.Module):
+
+    def __init__(
+        self, vis_pos_emb_module, aud_pos_emb_module, num_offset_cls,
+        visual_block_shape, audio_block_shape, pre_norm_cfg, v_selector_cfg, a_selector_cfg, mixed_selector_cfg, global_transformer_cfg,
+        n_layer=12, n_head=8, n_embd=256, tok_pdrop=0., embd_pdrop=0., resid_pdrop=0., attn_pdrop=0.,
+        n_unmasked=0, ablate_mixer=False, ablate_selector=False, cascade_selection=0):
+        super().__init__()
+        self.config = Config(
+            num_offset_cls=num_offset_cls, audio_block_shape=audio_block_shape,
+            visual_block_shape=visual_block_shape, embd_pdrop=embd_pdrop, resid_pdrop=resid_pdrop,
+            attn_pdrop=attn_pdrop, tok_pdrop=tok_pdrop, n_layer=n_layer, n_head=n_head, n_embd=n_embd,
+            n_unmasked=n_unmasked, ablate_mixer=False, ablate_selector=False
+        )
+        super().__init__()
+        # input norm
+        self.pre_lnorm_vis = instantiate_from_config(pre_norm_cfg)
+        self.pre_lnorm_aud = instantiate_from_config(pre_norm_cfg)
+        # pos embeddings on features
+        self.vis_pos_emb = instantiate_from_config(vis_pos_emb_module)
+        self.aud_pos_emb = instantiate_from_config(aud_pos_emb_module)
+        # selector transformers
+        self.v_selector = instantiate_from_config(v_selector_cfg)  # FeatureSelectorTransformer
+        self.a_selector = instantiate_from_config(a_selector_cfg)  # FeatureSelectorTransformer
+
+        self.cascade_selection = cascade_selection
+
+        # Add the Selector Mixing Transformer Here
+        self.selector_mixing = not (ablate_mixer and ablate_selector)
+        if self.selector_mixing:
+            self.va_selector_mixer = FeatureSelectorMixingTransformer(self.v_selector.num_selectors, self.a_selector.num_selectors, mixed_selector_cfg, n_embd, n_head)
+
+        # aggregation transformer
+        self.global_transformer = instantiate_from_config(global_transformer_cfg)  # GlobalTransformer
+        # head
+        if isinstance(self.global_transformer, GlobalMLP):
+            N_av = a_selector_cfg.params.num_selectors + v_selector_cfg.params.num_selectors
+            self.off_head = torch.nn.Linear(N_av*self.config.n_embd, self.config.num_offset_cls)
+        else:
+            self.off_head = torch.nn.Linear(self.config.n_embd, self.config.num_offset_cls, bias=False)
+        self.offset_tok = torch.nn.Parameter(torch.randn(1, self.config.num_offset_cls, n_embd))
+
+        self.streaming_down_proj = torch.nn.Linear(self.config.n_embd * 3, self.config.n_embd)
+        self.apply(init_weights)
+
+    def forward(self, vis: torch.Tensor, aud: torch.Tensor, return_attn_weights=False, detach_base=False):
+        B, Tv, Dv, H, W = vis.shape
+        B, Da, F, Ta = aud.shape
+        assert Da == Dv, f'Please define a bridge or fix {Da} vs {Dv}'
+        # (B, Tv, H, W, Dv), (B, F, Ta, Da) <-
+        vis, aud = vis.permute(0, 1, 3, 4, 2).contiguous(), aud.permute(0, 2, 3, 1).contiguous()
+        # making sure that both embeddings are normalized to the same base (can be configured as identity tho)
+        vis, aud = self.pre_lnorm_vis(vis), self.pre_lnorm_aud(aud)
+        # apply individual pos embeddings
+        vis_context, aud_context = self.vis_pos_emb(vis), self.aud_pos_emb(aud)
+       
+        if self.cascade_selection == 1:
+            if return_attn_weights:
+                vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)
+                aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights, extra_selectors=vis)
+            else:
+                vis = self.v_selector(vis_context)
+                aud = self.a_selector(aud_context, extra_selectors=vis)
+        elif self.cascade_selection == 2:
+            if return_attn_weights:
+                aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights)
+                vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights, extra_selectors=aud)
+            else:
+                aud = self.a_selector(aud_context)
+                vis = self.v_selector(vis_context, extra_selectors=aud)
+        else:
+            if return_attn_weights:
+                vis, vis_self_attns1, vis_cross_attns1 = self.v_selector(vis_context, return_attn_weights=return_attn_weights)
+                aud, aud_self_attns1, aud_cross_attns1 = self.a_selector(aud_context, return_attn_weights=return_attn_weights)
+            else:
+                # narrow down the dimension with selectors
+                vis, aud = self.v_selector(vis_context), self.a_selector(aud_context)
+
+        # mix selectors
+        if self.selector_mixing:
+            if return_attn_weights:
+                vis, aud, vis_self_attns2, aud_self_attns2, vis_cross_attns2, aud_cross_attns2 = self.va_selector_mixer(vis, aud, vis_context, aud_context, return_attn_weights=return_attn_weights)
+            else:
+                vis, aud = self.va_selector_mixer(vis, aud, vis_context, aud_context)
+        
+        # aggregate infomation
+        output_features = self.global_transformer(vis, aud)
+        if (detach_base):
+            output_features = output_features.detach()
+        # picking the first token which correspond to the `off_tok` as the prediction token
+        off_logits = self.off_head(output_features[:, 0, :])
+        # Get learned embeddings for each offset class
+        offset_tok = self.offset_tok.expand(B, -1, -1)
+        # Find output features as softmax weighted average based on logits
+        offset_tok = torch.bmm(offset_tok.permute(0, 2, 1), torch.nn.functional.softmax(off_logits, dim=-1).unsqueeze(-1)).squeeze(-1)
+        # Aggregate weighted average offset logit features, raw offset features, and pass forward token features and down project 
+        streaming_features = torch.cat((offset_tok, output_features[:, 0, :], output_features[:, 1, :]), dim=1)
+        streaming_features = self.streaming_down_proj(streaming_features)
+
+        if return_attn_weights:
+            if self.selector_mixing:
+                return off_logits, streaming_features, vis_self_attns1, aud_self_attns1, vis_cross_attns1, aud_cross_attns1, vis_self_attns2, aud_self_attns2, vis_cross_attns2, aud_cross_attns2
+            else:
+                return off_logits, streaming_features, vis_self_attns1, aud_self_attns1, vis_cross_attns1, aud_cross_attns1 # No second round of selectors
+        else:
+            return off_logits, streaming_features
+
 class SparseSync(torch.nn.Module):
 
     def __init__(
@@ -240,6 +347,93 @@ class GlobalTransformer(torch.nn.Module):
         x = self.blocks(x)
         x = self.ln_f(x)
         return x
+    
+
+class StreamingGlobalTransformer(torch.nn.Module):
+
+    def __init__(self, tok_pdrop, embd_pdrop, resid_pdrop, attn_pdrop, n_layer, n_head, n_embd) -> None:
+        super().__init__()
+        self.config = Config(embd_pdrop=embd_pdrop, resid_pdrop=resid_pdrop, attn_pdrop=attn_pdrop,
+                             n_layer=n_layer, n_head=n_head, n_embd=n_embd)
+        # input norm
+        self.vis_in_lnorm = torch.nn.LayerNorm(self.config.n_embd)
+        self.aud_in_lnorm = torch.nn.LayerNorm(self.config.n_embd)
+        # aux tokens
+        self.OFF_tok = torch.nn.Parameter(torch.randn(1, 1, n_embd))
+        self.PASS_tok = torch.nn.Parameter(torch.randn(1, 1, n_embd))
+        self.MOD_tok = torch.nn.Parameter(torch.randn(1, 1, n_embd))
+        # whole token dropout
+        self.tok_drop_vis = torch.nn.Dropout2d(tok_pdrop)
+        self.tok_drop_aud = torch.nn.Dropout2d(tok_pdrop)
+        # the stem
+        self.drop = torch.nn.Dropout(embd_pdrop)
+        self.blocks = torch.nn.Sequential(*[Block(self.config) for _ in range(self.config.n_layer)])
+        # pre-output norm
+        self.ln_f = torch.nn.LayerNorm(self.config.n_embd)
+
+        self.apply(init_weights)
+
+    def forward(self, vis_selectors: torch.Tensor, aud_selectors: torch.Tensor, targets=None):
+        B, Sv, D = vis_selectors.shape
+        B, Sa, D = aud_selectors.shape
+        # broadcasting special tokens to the batch size
+        off_tok = einops.repeat(self.OFF_tok, '1 1 d -> b 1 d', b=B)
+        pass_tok = einops.repeat(self.PASS_tok, '1 1 d -> b 1 d', b=B)
+        mod_tok = einops.repeat(self.MOD_tok, '1 1 d -> b 1 d', b=B)
+        # norm
+        vis_selectors, aud_selectors = self.vis_in_lnorm(vis_selectors), self.aud_in_lnorm(aud_selectors)
+        # maybe whole token dropout
+        vis_selectors, aud_selectors = self.tok_drop_vis(vis_selectors), self.tok_drop_aud(aud_selectors)
+        # (B, 2+Sv+1+Sa, D)
+        x = torch.cat((off_tok, pass_tok, vis_selectors, mod_tok, aud_selectors), dim=1)
+        # dropout -> stem -> norm
+        x = self.drop(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        return x
+    
+class StreamingTransformer(torch.nn.Module):
+
+    def __init__(self, tok_pdrop, embd_pdrop, resid_pdrop, attn_pdrop, n_layer, n_head, n_embd, num_offset_cls, streaming_pos_emb_module) -> None:
+        super().__init__()
+        self.config = Config(embd_pdrop=embd_pdrop, resid_pdrop=resid_pdrop, attn_pdrop=attn_pdrop,
+                             n_layer=n_layer, n_head=n_head, n_embd=n_embd)
+        # input norm
+        self.in_lnorm = torch.nn.LayerNorm(self.config.n_embd)
+        # aux tokens
+        self.OFF_tok = torch.nn.Parameter(torch.randn(1, 1, n_embd))
+        # whole token dropout
+        self.tok_drop = torch.nn.Dropout2d(tok_pdrop)
+        # the stem
+        self.drop = torch.nn.Dropout(embd_pdrop)
+        self.blocks = torch.nn.Sequential(*[Block(self.config) for _ in range(self.config.n_layer)])
+        # pre-output norm
+        self.ln_f = torch.nn.LayerNorm(self.config.n_embd)
+
+        self.streaming_pos_emb_module = instantiate_from_config(streaming_pos_emb_module)
+
+        self.logit_head = torch.nn.Linear(self.config.n_embd, num_offset_cls)
+
+        self.apply(init_weights)
+
+    def forward(self, input_features: torch.Tensor, targets=None):
+        B, Sv, D = input_features.shape
+        # broadcasting special tokens to the batch size
+        off_tok = einops.repeat(self.OFF_tok, '1 1 d -> b 1 d', b=B)
+        # norm
+        x = self.in_lnorm(input_features)
+        # maybe whole token dropout
+        x = self.tok_drop(x)
+
+        x = self.streaming_pos_emb_module(x)
+        # (B, 2+Sv+1+Sa, D)
+        x = torch.cat((off_tok, x), dim=1)
+        # dropout -> stem -> norm
+        x = self.drop(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        x = self.logit_head(x[:, 0, :])
+        return x
 
 
 class GlobalMLP(torch.nn.Module):
@@ -284,6 +478,79 @@ def init_weights(module):
     elif isinstance(module, torch.nn.LayerNorm):
         module.bias.data.zero_()
         module.weight.data.fill_(1.0)
+
+class PositionEmbeddingSinusoidalStreamingHead(torch.nn.Module):
+    def __init__(self, time_periodicity, n_embd, project) -> None:
+        super().__init__()
+        self.time_periodicity = time_periodicity
+        self.n_embd = n_embd
+        self.project = project
+        if (self.project):
+            self.up_proj = torch.nn.Linear(n_embd, n_embd, bias=False)
+            self.gate_proj = torch.nn.Linear(n_embd, n_embd, bias=True)
+            self.down_proj = torch.nn.Linear(n_embd, n_embd, bias=False)
+    def forward(self, x: torch.Tensor, time_intervals: torch.Tensor = None) -> torch.Tensor:
+        '''
+        Args:
+            x (torch.Tensor): a batch of selectors (B, S, d)
+            time_intervals (torch.Tensor): a batch of time intervals (B)
+        Returns:
+            torch.Tensor: x + pos
+        '''
+        pos = self.make_pos_emb(x, time_intervals)
+        if (self.project):
+            pos = self.down_proj(torch.nn.functional.relu(self.gate_proj(pos)) * self.up_proj(pos))
+        return x + pos
+
+    def make_pos_emb(self, x, time_intervals = None):
+        B, S, d = x.shape
+        device = x.device
+
+        # Calculate the position indices adjusted by time intervals
+        if (time_intervals is None):
+            time_intervals = torch.ones((B,), device=x.device)
+        time_intervals = time_intervals.view(B, 1).to(device)
+        position_indices = torch.arange(S, device=device).expand(B, -1)
+        adjusted_positions = position_indices.float() * time_intervals
+        adjusted_positions = adjusted_positions.view(B, -1, 1).expand(-1, -1, d // 2)
+        # Create sinusoidal embeddings
+        pos = torch.zeros((B, S, d), device=device)
+        div_term = torch.exp(torch.arange(0, d, 2).float() * (-math.log(10000.0) / d)).to(device).view(1, 1, -1)
+        pos[:, :, 0::2] = torch.sin(2 * math.pi * adjusted_positions * div_term / self.time_periodicity)
+        pos[:, :, 1::2] = torch.cos(2 * math.pi * adjusted_positions * div_term / self.time_periodicity)
+
+        return pos
+
+class PositionEmbeddingLearnedStreamingHead(torch.nn.Module):
+
+    def __init__(self, max_pos, n_embd) -> None:
+        super().__init__()
+        self.max_t = max_pos
+        self.n_embd = n_embd
+        self.time_embed = torch.nn.Embedding(self.max_t, self.n_embd)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.uniform_(self.time_embed.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        '''
+        Args:
+            x (torch.Tensor): a batch of selectors (B, max_t, d)
+        Returns:
+            torch.Tensor: x + pos
+        '''
+        return x + self.make_pos_emb(x)
+
+    def make_pos_emb(self, x):
+        B, S, d = x.shape
+        t_i = torch.arange(S, device=x.device)
+        # (S, D)
+        pos = self.time_embed(t_i)
+        # (B, S, d) <- (1, S, d) <- (S, d)
+        pos = pos.view(1, S, d).repeat(B, 1, 1)
+        return pos
+
 
 
 class PositionEmbeddingSelectors(torch.nn.Module):

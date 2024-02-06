@@ -1,7 +1,7 @@
 action: train_avsync_model
 
 model:
-  target: model.sync_model.AVSyncModel
+  target: model.sync_model.StreamingAVSyncModel
   params:
     afeat_extractor:
       is_trainable: True
@@ -28,7 +28,7 @@ model:
         padding: [0, 0, 0]
         bias: True
     transformer:
-      target: model.modules.feature_selector.SparseSync
+      target: model.modules.feature_selector.StreamingSparseSync
       params:
         num_offset_cls: 21  # e.g. 21 for (-2.0, -1.8, ..., 0.0, ..., 1.8, 2.0)
         visual_block_shape: [16, 7, 7] # see the output of the feature_extractors [50, 7, 7] - rn; [16, 7, 7] - s3d; [50, 14, 14] - vit
@@ -103,7 +103,7 @@ model:
             pos_emb_cfg: ${model.params.transformer.params.a_selector_cfg.params.pos_emb_cfg}
         global_transformer_cfg:
           # target: model.modules.feature_selector.GlobalMLP
-          target: model.modules.feature_selector.GlobalTransformer
+          target: model.modules.feature_selector.StreamingGlobalTransformer
           params:
             n_layer: ${model.params.transformer.params.n_layer}
             n_head: ${model.params.transformer.params.n_head}
@@ -112,19 +112,36 @@ model:
             embd_pdrop: ${model.params.transformer.params.embd_pdrop}
             resid_pdrop: ${model.params.transformer.params.resid_pdrop}
             attn_pdrop: ${model.params.transformer.params.attn_pdrop}
+    streaming_head:
+      target: model.modules.feature_selector.StreamingTransformer
+      params:
+        n_layer: ${model.params.transformer.params.n_layer}
+        n_head: ${model.params.transformer.params.n_head}
+        n_embd: ${model.params.transformer.params.n_embd}
+        tok_pdrop: ${model.params.transformer.params.tok_pdrop}
+        embd_pdrop: ${model.params.transformer.params.embd_pdrop}
+        resid_pdrop: ${model.params.transformer.params.resid_pdrop}
+        attn_pdrop: ${model.params.transformer.params.attn_pdrop}
+        num_offset_cls: ${model.params.transformer.params.num_offset_cls}
+        streaming_pos_emb_module:
+          target: model.modules.feature_selector.PositionEmbeddingSinusoidalStreamingHead
+          params:
+            time_periodicity: 100 # Time before which positional embeddings begin to repeat (in seconds)
+            n_embd: ${model.params.transformer.params.n_embd}
+            project: True
 
 training:
-  freeze_first: 0
+  freeze_first: 500
   base_learning_rate: 5e-6
-  base_batch_size: 4
+  base_batch_size: 2
   base_batch_size_eval: 12
-  accumulation_steps: 1
+  accumulation_steps: 2
   val_per_num_iters: 500
   num_workers: 0
   num_epochs: 10000
   patience: 140
   to_max_metric: True
-  metric_name: 'mAP_singleshot_logits_iter7'
+  metric_name: 'mAP_streaming_logits_iter11'
   early_stop_phase: 'valid'  # care about which phase when deciding to early stop
   use_half_precision: True
   mixup_alpha: 0.0 # the distribution parameter. Use 0.0 to turn off mixup
@@ -139,9 +156,9 @@ training:
   run_corrupted_val: False
   lr_scheduler:
     name: 'warmup_constant_decay' # 'constant_with_warmup'  # 'constant' 'constant_with_warmup'
-    warmup: 1000 # iterations to recover from base_learning_rate / 100
-    constant: 10000
-    remaining: 28000
+    warmup: 500 # iterations to recover from base_learning_rate / 100
+    constant: 5000
+    remaining: 7000
   optimizer:
     name: adam # adamw, adam or sgd
     betas: [0.9, 0.999]
@@ -154,10 +171,10 @@ data:
   loading_shift: [2, 2]
   loading_buffer: 1
   streaming: 
-    enabled: False
+    enabled: True
     streaming_hop: 1
     streaming_hop_variance: 0.0
-    max_streaming_frames: 8
+    max_streaming_frames: 12
     num_frames_to_train_on: 3
   vids_path: '/data/scratch/layneberry/avsync_videos/videos_at_25_fps-encode_script/' # 'PLACEHOLDER' # something that ends with 'CODEC_video_XXfps_YYYside_ZZZZZhz' or '..._25fps_...'
   size_before_crop: 256  # video resolution -> size_before_crop resolution -> input_size (crop resolution)
@@ -184,18 +201,36 @@ data:
 
 # sequentially defined
 transform_sequence_train:
-  - target: dataset.transforms.EqualifyFromRight
+  - target: dataset.transforms.EqualifyFromRightStreaming
     params:
-      clip_max_len_sec: 10 # for LRS3 this can be increased to allow more training data as clips may be >10s
+      crop_len_sec: ${data.crop_len_sec}
+      loading_shift: ${data.loading_shift}
+      loading_buffer: ${data.loading_buffer}
+      streaming_enabled: ${data.streaming.enabled}
+      streaming_hop: ${data.streaming.streaming_hop}
+      streaming_hop_variance: ${data.streaming.streaming_hop_variance}
+      max_streaming_frames: ${data.streaming.max_streaming_frames}
   - target: dataset.transforms.RGBSpatialCropSometimesUpscale
     params:
       sometimes_p: ${data.sometimes_upscale_p}
       smaller_input_size: 192 # the size of the smaller crop. null 192 112
       target_input_size: ${data.input_size}
       is_random: ${data.is_spatial_crop_random}
-  - target: dataset.transforms.TemporalCropAndOffsetRandomFeasible
+  #- target: dataset.transforms.TemporalCropAndOffsetRandomFeasible
+  #  params:
+  #    crop_len_sec: ${data.crop_len_sec}
+  #    max_off_sec: ${data.max_off_sec}
+  #    max_wiggle_sec: ${data.audio_jitter_sec}
+  #    do_offset: ${data.do_offset}
+  #    grid_type: 'linspace' # uniform linspace
+  #    grid_size: ${model.params.transformer.params.num_offset_cls}
+  #    smoothing: 0.1
+  - target: dataset.transforms.TemporalCropAndOffsetRandomFeasibleStreaming
     params:
       crop_len_sec: ${data.crop_len_sec}
+      crop_streaming_frames: ${data.streaming.max_streaming_frames}
+      crop_streaming_frame_length: ${data.streaming.streaming_hop}
+      crop_streaming_frame_variance: ${data.streaming.streaming_hop_variance}
       max_off_sec: ${data.max_off_sec}
       max_wiggle_sec: ${data.audio_jitter_sec}
       do_offset: ${data.do_offset}
@@ -270,7 +305,7 @@ transform_sequence_test:
       crop_len_sec: ${data.crop_len_sec}
       loading_shift: ${data.loading_shift}
       loading_buffer: ${data.loading_buffer}
-      streaming_enabled: True
+      streaming_enabled: ${data.streaming.enabled}
       streaming_hop: ${data.streaming.streaming_hop}
       streaming_hop_variance: ${data.streaming.streaming_hop_variance}
       max_streaming_frames: ${data.streaming.max_streaming_frames}
@@ -324,5 +359,6 @@ logging:
   use_wandb: True
 
 resume_scheduler_opt_scaler: False
+#ckpt_path: ./logs/sync_models/24-01-23T22-48-53/24-01-23T22-48-53.pt
+
 ckpt_path: ./logs/sync_models/22-07-28T15-49-45/22-07-28T15-49-45.pt
-# ckpt_path: ./logs/sync_models/23-05-09T01-14-10/23-05-09T01-14-10.pt
