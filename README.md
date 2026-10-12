@@ -1,447 +1,151 @@
-# UT Fork of SparseSync
+# StreamSync
 
-## RealSync dataset (WACV 2025)
+**Streaming audio–visual synchronization for real-world videos.**
 
-RealSync accompanies [Temporally Streaming Audio-Visual Synchronization for Real-World Videos](https://openaccess.thecvf.com/content/WACV2025/papers/Voas_Temporally_Streaming_Audio-Visual_Synchronization_for_Real-World_Videos_WACV_2025_paper.pdf).
-The dataset manifests, annotations, preparation tools, and documentation are maintained separately in [jvoas655/RealSync](https://github.com/jvoas655/RealSync).
-The public [v0.1.0 release](https://github.com/jvoas655/RealSync/releases/tag/v0.1.0) contains the verified cleaned uniform-offset manifests and saved talking-head, voice-over, and BEATs annotations. Researchers obtain source videos separately. Complete reconstruction from full source videos remains pending; the dataset repository documents the remaining cutting, preprocessing, and timing checks.
+Code accompanying [Temporally Streaming Audio-Visual Synchronization for Real-World Videos](https://openaccess.thecvf.com/content/WACV2025/papers/Voas_Temporally_Streaming_Audio-Visual_Synchronization_for_Real-World_Videos_WACV_2025_paper.pdf), **WACV 2025**.
 
+Jordan Voas, Wei-Cheng Tseng, Layne Berry, Xixi Hu, Puyuan Peng, James Stuedemann, and David Harwath.
 
-To run tests with the original model architecture, set model.params.transformer.params.ablate_mixer and model.params.transformer.params.ablate_selector to "True" in the config file. To run tests with the additional features added by James, set both to "False". 
+[Paper](https://openaccess.thecvf.com/content/WACV2025/papers/Voas_Temporally_Streaming_Audio-Visual_Synchronization_for_Real-World_Videos_WACV_2025_paper.pdf) · [Supplement](https://openaccess.thecvf.com/content/WACV2025/supplemental/Voas_Temporally_Streaming_Audio-Visual_WACV_2025_supplemental.pdf) · [RealSync dataset](https://github.com/jvoas655/RealSync) · [Dataset release](https://github.com/jvoas655/RealSync/releases/tag/v0.1.0)
 
-Below README.md file is from the original SparseSync repo. This fork exists for evaluating SparseSync on our data and experimenting with modifications to the SparseSync architecture. 
+## Overview
 
+StreamSync estimates the temporal offset between the audio and visual streams of a video. It processes successive short windows and carries learned streaming tokens between predictions, allowing synchronization evidence to accumulate over time. This is particularly useful when visible and audible events are sparse or intermittent.
 
-# Audio-visual Synchronisation with Trainable Selectors
+![StreamSync architecture: a modified snapshot predictor emits an offset prediction and a streaming token; the streaming head predicts from the token history.](docs/assets/streamsync-architecture.png)
 
-This is the official implementation of
+*Figure 3 from the author-provided WACV paper source. Input windows are processed sequentially; the diagram illustrates how their streaming tokens are combined.*
 
-[Iashin, V., Xie, W., Rahtu, E. and Zisserman, A. "Sparse in Space and Time: Audio-visual Synchronisation with Trainable Selectors"](https://arxiv.org/abs/2210.07055)
+The paper's snapshot predictor builds on **SparseSync**. It produces an immediate offset prediction and a streaming token derived from its classification and passthrough tokens. A streaming head uses the token history to make a prediction with longer temporal context.
 
-BMVC 2022 (Spotlight Presentation)
+The task uses 21 offset classes spanning −2 to +2 seconds in 0.2-second increments. Positive injected offsets select later source audio, making the audible event lead its visual counterpart. The paper studies both Transformer and LSTM streaming heads; this checkout contains the Transformer implementation.
 
-• [[Project Page](https://v-iashin.github.io/SparseSync)]
-• [[ArXiv](https://arxiv.org/abs/2210.07055)]
-•
-<!-- • [[BMVC Proceedings](https://www.bmvc2021-virtualconference.com/conference/papers/paper_1213.html)] -->
-<!-- • [[Poster (for PAISS)](https://v-iashin.github.io/images/specvqgan/poster.pdf)] -->
-<!-- • [[Presentation on YouTube](https://www.youtube.com/watch?v=Bucb3nAa398)] ([Can't watch YouTube?](https://a3s.fi/swift/v1/AUTH_a235c0f452d648828f745589cde1219a/specvqgan_public/SpecVQGAN%20YouTube.mp4)) -->
+## Repository status
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1rawAPksDHUioSXcAbQTn_kMbDl3nYg8q?usp=sharing)
+This is the original research checkout, developed around AWS EC2/S3 and inherited SparseSync components. Some dataset paths, checkpoint references, and cluster scripts remain specific to that environment. A standalone local-server workflow and paper-checkpoint validation are pending; the setup below describes the existing code.
 
-<img src="https://v-iashin.github.io/images/sparsesync/sparse_selector_teaser.png" alt="SparseSync Teaser (comparing viddeos with dense and sparse signals)" width="900">
+StreamSync's snapshot code is inherited from [SparseSync](https://github.com/v-iashin/SparseSync). **Synchformer** is a comparison model in the paper, and **AS-Synchformer** is subsequent work with a separate implementation. This repository should not be treated as their code release.
 
-Audio-visual synchronisation is the task of determining the temporal offset between the audio and visual
-streams in a video.
-The synchronisation of 'in the wild' video clips might be challenged as the synchronisation cues might be
-spatially small and occur sparsely in time.
-However, recent literature was mostly dedicated to exploring videos of talking heads or playing instruments.
-Such videos have a dense synchronisation signal due to the strong correlation between audio and visual streams.
+## RealSync dataset
 
-<img src="https://v-iashin.github.io/images/sparsesync/sparse_selector_arch.png" alt="SparseSync Architecture" width="900">
+Dataset manifests, annotations, reconstruction tooling, and documentation are maintained separately in [jvoas655/RealSync](https://github.com/jvoas655/RealSync).
 
-To handle the synchronisation of sparse signals in time a model should be able to process longer video clips
-and have enough capacity to handle the diversity of scenes.
-To this end, we propose _SparseSelector_, a transformer-based architecture that enables the processing
-of long videos in linear complexity with respect to the number of input tokens which grows
-rapidly with sampling rate, resolution, and video duration.
+The public [v0.1.0 metadata release](https://github.com/jvoas655/RealSync/releases/tag/v0.1.0) freezes the author-selected **cleaned uniform-offset collection**:
 
-- [Audio-visual Synchronisation with Trainable Selectors](#audio-visual-synchronisation-with-trainable-selectors)
-  - [Environment Preparation](#environment-preparation)
-    - [Conda](#conda)
-    - [Docker](#docker)
-  - [Prepare Data](#prepare-data)
-    - [LRS3-H.264 and LRS3-H.264 ('No Face Crop')](#lrs3-h264-and-lrs3-h264-no-face-crop)
-    - [VGGSound-Sparse](#vggsound-sparse)
-  - [Pre-trained Model Checkpoints](#pre-trained-model-checkpoints)
-    - [LRS3 ('No Face Crop') Models](#lrs3-no-face-crop-models)
-    - [VGGSound-Sparse Models](#vggsound-sparse-models)
-  - [Training](#training)
-    - [(Pre-)Train on LRS3-H.264 ('No face crop')](#pre-train-on-lrs3-h264-no-face-crop)
-    - [Finetune on VGGSound-Sparse](#finetune-on-vggsound-sparse)
-    - [Train Audio Feature Extractor](#train-audio-feature-extractor)
-  - [Evaluation](#evaluation)
-  - [Examples](#examples)
-  - [Citation](#citation)
-  - [LICENSE](#license)
-  - [Acknowledgements](#acknowledgements)
+| Split | Source videos | Samples |
+|---|---:|---:|
+| Train | 511 | 269,890 |
+| Validation | 74 | 16,944 |
+| Test | 85 | 16,529 |
 
-## Environment Preparation
-During experimentation, we used Linux machines with `conda` virtual environments, PyTorch 1.11 and CUDA 11.3.
+It contains 670 sources, 11,039 clip definitions, and 303,363 sample instructions, together with saved talking-head, voice-over, and BEATs audio-event annotations. Researchers obtain source videos independently; the dataset release does not redistribute them.
 
-Start by cloning this repo
+Start with the [dataset guide](https://github.com/jvoas655/RealSync/blob/v0.1.0/docs/DATASET_GUIDE.md), [reconstruction walkthrough](https://github.com/jvoas655/RealSync/blob/v0.1.0/docs/RECONSTRUCTION.md), and [reproducibility notes](https://github.com/jvoas655/RealSync/blob/v0.1.0/docs/REPRODUCIBILITY.md). Exact full-video cutting, complete historical re-encoding, and annotation timestamp registration remain unresolved. The selected release differs from the WACV paper's headline clip count and described normal-offset protocol.
+
+The historical StreamSync loader has its own seek/slicing behavior, reversed validation/test aliases, private skip lists, and a 2,000-row evaluation cap. Its outputs and effective evaluation population are not interchangeable with the released dataset's strict reference reader. Record the actual manifest mapping and evaluated IDs when comparing results.
+
+## Environment setup
+
+The inherited environment export specifies Python 3.8, PyTorch 1.11, torchvision 0.12, torchaudio 0.11, and CUDA 11.3. It is retained as a historical starting point rather than a freshly verified installation recipe.
 
 ```bash
-git clone https://github.com/v-iashin/SparseSync.git
-```
-
-### Conda
-
-Next, install the environment.
-For your convenience, we provide a `conda` environment:
-<!-- and docker environments. -->
-```bash
+git clone https://github.com/jvoas655/StreamSync.git
+cd StreamSync
 conda env create -f conda_env.yml
-```
-
-Test your environment
-
-```bash
 conda activate sparse_sync
-python -c "import torch; print(torch.cuda.is_available())"
-# True
 ```
 
-### Docker
-Download the image from Docker Hub and test if CUDA is available:
-```bash
-docker run \
-    --mount type=bind,source=/absolute/path/to/SparseSync/,destination=/home/ubuntu/SparseSync/ \
-    --mount type=bind,source=/absolute/path/to/logs/,destination=/home/ubuntu/SparseSync/logs/ \
-    --shm-size 8G \
-    -it --gpus '"device=0"' \
-    iashin/sparse_sync:latest \
-    python
->>> import torch; print(torch.cuda.is_available())
-# True
-```
-or build it yourself
-```bash
-docker build - < Dockerfile --tag specvqgan
-```
+The environment name remains `sparse_sync` because it is defined in the existing export. The AWS data loader also imports `s3fs`, which is absent from that export and must be installed separately for the historical S3 workflow.
 
-Try one of the examples:
-```bash
-docker run \
-    --mount type=bind,source=/absolute/path/to/SparseSync/,destination=/home/ubuntu/SparseSync/ \
-    --mount type=bind,source=/absolute/path/to/logs/,destination=/home/ubuntu/SparseSync/logs/ \
-    --shm-size 8G \
-    -it --gpus '"device=0"' \
-    iashin/sparse_sync:latest \
-    bash
-
-ubuntu@cfc79e3be757:~$
-cd SparseSync/
-
-ubuntu@cfc79e3be757:~/SparseSync$
-python ./scripts/example.py \
-  --exp_name "22-09-21T21-00-52" \
-  --vid_path "./data/vggsound/h264_video_25fps_256side_16000hz_aac/3qesirWAGt4_20000_30000.mp4" \
-  --offset_sec 1.6
-# Prediction Results:
-# p=0.8652 (8.4451), "1.60" (18)
-```
-
-## Prepare Data
-
-In this project, we used the
-[LRS3](https://www.robots.ox.ac.uk/~vgg/data/lip_reading/lrs3.html) dataset
-and introduced a novel VGGSound-Sparse dataset.
-We provide the pre-processing scripts and assume that the original videos have been downloaded from YouTube.
-
-### LRS3-H.264 and LRS3-H.264 ('No Face Crop')
-
-**Difference between `LRS3` and `LRS3-H.264` and `LRS3-H.264 ('No Face Crop')`**
-For the setting 'dense in time and space', we rely on the LRS3 dataset.
-One may access the original LRS3 dataset by following the instructions on the
-[project page](https://www.robots.ox.ac.uk/~vgg/data/lip_reading/lrs3.html).
-However, this dataset is encoded with `MPEG-4 Part 2` codec.
-As per our discussion in the paper (sec. 4.), we would like to avoid this encoding.
-For this reason, we obtain the original videos from YouTube using the provided
-links (mind that `_` and `-` in video ids were replaced by `S`).
-By doing so, we could use videos with `H.264` encoding which has another benefit.
-In particular, the videos are of slightly better quality.
-
-Another difference to the original LRS3 is in the way a face is cropped.
-We could not replicate the same cropping algorithm but the authors
-[provided](https://www.robots.ox.ac.uk/~vgg/data/lip_reading/lrs3.html)
-bounding coordinates for a 'tight' crop.
-We simply expanded the rectangular region to have square proportions and ensured
-the bounding box within the video frame to avoid padding.
-This has two benefits compared to the original `LRS3`: padding is not visible
-and the visual track is not smooth which gives some sort of a natural
-augmentation during training.
-The trimming and cropping scripts are provided in `./scripts/make_lrs3_again.py`.
-
-The `LRS3-H.264 ('No Face Crop')` variant of the dataset does not have a face crop.
-
-Therefore, the pre-processing pipeline is as follows.
-*First*, obtain the original videos from YouTube
-(ids are provided on [LRS3 project page](https://www.robots.ox.ac.uk/~vgg/data/lip_reading/lrs3.html)).
-*Second*, slice each video into clips, do face crop, and resizing according to the LRS3 meta (see the link)
-data with the `./scripts/make_lrs3_again.py` script.
-
-For `LRS3-H.264 ('No Face Crop')` use:
-```bash
-python ./scripts/make_lrs3_again.py \
-    --lrs_meta_root "$LRS3_ROOT/orig_full/lrs3_v0.4/" \
-    --full_vids_root "$LRS3_ROOT/orig_full/data/lrs_ref/video/" \
-    --save_root "./data/lrs3/h264_uncropped_25fps_256side_16000hz_aac/" \
-    --rescale_to_px 256
-```
-where `full_vids_root` has full-length `.mp4` videos downloaded from YouTube.
-
-For `LRS3-H.264` use:
-```bash
-python ./scripts/make_lrs3_again.py \
-    --lrs_meta_root "$LRS3_ROOT/orig_full/lrs3_v0.4/" \
-    --full_vids_root "$LRS3_ROOT/orig_full/data/lrs_ref/video/" \
-    --save_root "./data/lrs3/h264_orig_strict_crop_25fps_224side_16000hz_aac/" \
-    --do_face_crop \
-    --rescale_to_px 224
-```
-You can spawn as many processes as your machine permits to speed it up
-(e.g. by running the same command in separate terminals).
-The script (`./scripts/make_lrs3_again.py`) will randomize the order of videos to avoid processing collision.
-SLURM might help here if you have a cluster at your disposal.
-You may create an array of jobs running `./scripts/make_lrs3_again.py`.
-
-See `./data/lrs3/` (`LRS3_ROOT`) for the expected folder structure and a few examples.
-
-### VGGSound-Sparse
-
-VGGSound-Sparse is based on the
-[VGGSound dataset](https://www.robots.ox.ac.uk/~vgg/data/vggsound/)
-and you will need to obtain the original YouTube videos first.
-The annotations are freely
-[downloadable](https://v-iashin.github.io/assets/sparsesync/vggsound_sparse.csv).
-
-There is no specific pre-processing is required on VGGSound videos, except for reencoding of streams.
-This can be achieved with the script that is available in `./scripts/reencode_videos.py`.
-First, open the file and change the `ORIG_PATH` variable to a folder with a structure as in
-`./data/vggsound/video/`:
-```bash
-python ./scripts/reencode_videos.py
-```
-It is also safe to parallelize for multiple threads and, perhaps, a cluster.
-
-## Pre-trained Model Checkpoints
-
-When you run an [example](#examples),
-the checkpoints and configs for `SparseSync` will be downloaded automatically.
-Alternatively, you can download the pre-trained weights manually:
-
-### LRS3 ('No Face Crop') Models
-
-| Pre-trained on        | Fine-tuned on | Accuracy | config                                                                                                                              | ckpt                                                                                                                                              |
-| --------------------- | ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| LRS3 (‘No Face Crop’) | --            | 96.9     | [link](https://a3s.fi/swift/v1/AUTH_a235c0f452d648828f745589cde1219a/sync/sync_models/22-07-13T22-25-49/cfg-22-07-13T22-25-49.yaml) | [link](https://a3s.fi/swift/v1/AUTH_a235c0f452d648828f745589cde1219a/sync/sync_models/22-07-13T22-25-49/22-07-13T22-25-49.pt) (md5: `63f883e...`) |
-
-The model is evaluated on the test set of LRS3 ('No Face Crop')
-
-### VGGSound-Sparse Models
-
-| Pre-trained on        | Fine-tuned on   | Accuracy | config                                                                                                                              | ckpt                                                                                                                                                |
-| --------------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| LRS3 (‘No Face Crop’) | VGGSound-Sparse | 44.3     | [link](https://a3s.fi/swift/v1/AUTH_a235c0f452d648828f745589cde1219a/sync/sync_models/22-07-28T15-49-45/cfg-22-07-28T15-49-45.yaml) | [link](https://a3s.fi/swift/v1/AUTH_a235c0f452d648828f745589cde1219a/sync/sync_models/22-07-28T15-49-45/22-07-28T15-49-45.pt) (md5: `a26f207...`)   |
-| LRS3 (‘No Face Crop’) | VGGSound        | 51.2     | [link](https://a3s.fi/swift/v1/AUTH_a235c0f452d648828f745589cde1219a/sync/sync_models/22-09-21T21-00-52/cfg-22-09-21T21-00-52.yaml) | [link](https://a3s.fi/swift/v1/AUTH_a235c0f452d648828f745589cde1219a/sync/sync_models/22-09-21T21-00-52/22-09-21T21-00-52.pt) (md5:  `83fba5f...` ) |
-
-The models are evaluated on the test set of VGGSound-Sparse.
-
-## Training
-
-The final model is pre-trained on dense signals (LRS3-H.264) and then finetuned on VGGSound-Sparse.
-
-Besides plain `python` commands, we also provide `sbatch` scripts for distributed training.
-Adapt variables in these scripts according to your cluster setup.
-
-### (Pre-)Train on LRS3-H.264 ('No face crop')
+Check the imported libraries and the CPU VideoReader backend required by the loader:
 
 ```bash
-# conda activate sparse_sync
-python main.py \
-    config="./configs/sparse_sync.yaml" \
-    logging.logdir="./logs/sync_models/" \
-    data.vids_path="/path/to/h264_uncropped_25fps_256side_16000hz_aac/pretrain/vid_id/mp4s" \
-    data.dataset.target="dataset.lrs.LRS3" \
-    training.base_batch_size="10"
-    # logging.use_wandb="False"
-```
-On a cluster if not run from a sbatch script, it may fail with
-`ValueError: Error initializing torch.distributed` (complains about the absence of master address and port).
-You can either switch to sbatch scripts `./scripts`, define env variables:
-`export MASTER_ADDR=$MASTER_ADDR` and `export MASTER_PORT=$MASTER_PORT`, or use
-the [torch launcher](https://pytorch.org/docs/stable/elastic/run.html) `$ torchrun main.py ...`.
-
-You may resume the training as follows:
-```bash
-# which experiment to resume from `./logs/sync_models/xx-xx-xxTxx-xx-xx`
-CKPT_ID="xx-xx-xxTxx-xx-xx"
-
-# conda activate sparse_sync
-python main.py \
-    config="./logs/sync_models/$CKPT_ID/cfg-$CKPT_ID.yaml" \
-    training.resume="True" training.finetune="False"
-    # logging.use_wandb="False"
+python -c "import torch, torchvision, torchaudio; print(torch.__version__, torchvision.__version__, torchaudio.__version__)"
+python -c "import torchvision; torchvision.set_video_backend('video_reader'); print(torchvision.get_video_backend())"
 ```
 
-### Finetune on VGGSound-Sparse
-We found that pre-training on a dataset with 'dense' signals significantly improves the
-performance and training dynamics of the model trained on 'sparse' signals.
-Given the checkpoint `./logs/sync_models/xx-xx-xxTxx-xx-xx/xx-xx-xxTxx-xx-xx.pt` pre-trained
-on LRS3 ('No face crop'), you may finetune this checkpoint on VGGSound-Sparse as
+Some torchvision distributions omit the native FFmpeg VideoReader extension. A successful import alone does not establish a working decoder. Exact environment and decoder validation will accompany the portability update.
+
+## Model code and configurations
+
+| Path | Purpose |
+|---|---|
+| [main.py](main.py) | Configuration loading and training dispatch |
+| [model/sync_model.py](model/sync_model.py) | Snapshot and streaming model interfaces |
+| [model/modules/feature_selector.py](model/modules/feature_selector.py) | Sparse selectors, streaming tokens, and streaming Transformer |
+| [scripts/train_sync.py](scripts/train_sync.py) | Synchronization training and evaluation |
+| [scripts/train_utils.py](scripts/train_utils.py) | Dataset/model construction, distributed utilities, and checkpoint loading |
+| [dataset/sports_and_news.py](dataset/sports_and_news.py) | Historical RealSync-style loader with EC2/S3 assumptions |
+| [configs/streaming_sparse_sync.yaml](configs/streaming_sparse_sync.yaml) | Historical streaming Transformer configuration |
+| [configs/sparse_sync.yaml](configs/sparse_sync.yaml) | Snapshot SparseSync configuration |
+| [configs/sparse_sync_eval.yaml](configs/sparse_sync_eval.yaml) | Snapshot evaluation configuration |
+| [conda_env.yml](conda_env.yml) | Inherited environment export |
+
+`main.py` accepts OmegaConf configuration overrides using `key=value`. The existing streaming configuration uses 12 windows, a one-second hop, and a three-layer, 512-dimensional Transformer. It contains environment-specific media/log paths and an upstream starting checkpoint reference that must be checked before launching.
+
+The original launcher pattern is:
 
 ```bash
-# which experiment to resume from `./logs/sync_models/xx-xx-xxTxx-xx-xx`
-CKPT_ID="xx-xx-xxTxx-xx-xx"
-
-# conda activate sparse_sync
-python main.py \
-    config="./configs/sparse_sync.yaml" \
-    training.finetune="True" \
-    data.dataset.target="dataset.vggsound.VGGSoundSparsePicked" \
-    data.vids_path="/path/to/vggsound/h264_video_25fps_256side_16000hz_aac/" \
-    ckpt_path="./logs/sync_models/$CKPT_ID/$CKPT_ID.pt" \
-    data.audio_jitter_sec="0.05" \
-    data.p_horizontal_flip="0.5" \
-    data.sometimes_upscale_p="0.5" \
-    data.p_gray_scale="0.2" \
-    data.p_color_jitter="0.2" \
-    data.p_audio_aug="0.2" \
-    training.base_batch_size="10"
-    # data.dataset.params.load_fixed_offsets_on_test="False" \
-    # data.dataset.params.iter_times="10" \
-    # logging.use_wandb="False"
-```
-During fine-tuning, we used mostly the same parameters as during pre-training except for data augmentations.
-One may use `data.dataset.params.load_fixed_offsets_on_test="False"` and
-`data.dataset.params.iter_times="10"` to stabilize the training curves a bit.
-
-### Train Audio Feature Extractor
-The main training script loads both audio and RGB streams at once (`torchvision.io.read_video('path_to_mp4')`).
-The script for training an audio feature extractor uses `.wav` files to
-improve IO speed (`torchaudio.load('path_to_wav')`).
-If you want to train audio feature extractor you may want to extract `.wav` files from `.mp4` or
-adapt `datasets.vggsound.VGGSoundAudioOnly` to load audio from a `.mp4`.
-We provide the audio extraction script that will save the `.wav` files alongside the corresponding
-`.mp4` files:
-```bash
-# conda activate sparse_sync
-# num_workers specifies how many threads to use for extraction. It speeds up extraction significantly
-python ./scripts/extract_audio.py vid_dir="/path/to/h264_video_25fps_256side_16000hz_aac/mp4s" num_workers="8"
+# Requires the historical data/decoder setup and a trusted starting checkpoint.
+# Select a GPU reserved for your job before launching.
+torchrun --standalone --nproc_per_node=1 main.py \
+  config=./configs/streaming_sparse_sync.yaml \
+  ckpt_path=/path/to/trusted/snapshot-checkpoint.pt \
+  logging.logdir=./logs/streamsync logging.use_wandb=False
 ```
 
-Now, the feature extractor can be trained.
-The training will take a day or so on one `Nvidia 2080Ti 12GB`.
-One GPU will be enough for training.
-```bash
-## 5-second temporal crops
+This is a reference entry point, not a verified end-to-end reproduction command. The current loader forces its historical S3 media root; overriding `data.vids_path` alone does not make it a local-folder loader. The SLURM scripts and dataset-generation utilities are historical workflows that require separate review.
 
-# conda activate sparse_sync
-python main.py \
-    config="./configs/audio_feature_extractor.yaml" \
-    data.vids_dir="/path/to/folder/with/mp4s" \
-    data.crop_len_sec="5" \
-    # logging.use_wandb="False"
-```
+## Checkpoints and paper results
 
+A trained **StreamSync checkpoint is not currently published in this repository's GitHub releases**. The tracked `S3D_kinetics400_torchified.pt` file is a visual feature extractor, and the inherited download registry refers to upstream SparseSync checkpoints. Neither is a trained StreamSync model.
 
-## Evaluation
+Checkpoint identification, a small real-media verification, and publication are planned as a separate step. The historical [scripts/example.py](scripts/example.py) runs upstream SparseSync snapshot examples; it is not a StreamSync streaming demo.
 
-The training script will take care of it on its own.
-During training, the model will run a validation probe after each epoch.
-The script will early stop the training once the
-`training.metric_name` (accuracy) calculated on `training.early_stop_phase` (validation)
-did not improve for `training.patience` (70-140) consecutive epochs or if `training.num_epochs` is reached.
-After stopping the training, the model will do a probe on the test set.
-
-However, if you would like to do it manually, here is the code chunk:
-```bash
-# which experiment to resume from `./logs/sync_models/xx-xx-xxTxx-xx-xx`
-CKPT_ID="xx-xx-xxTxx-xx-xx"
-
-srun python main.py \
-    config="./logs/sync_models/$CKPT_ID/cfg-$CKPT_ID.yaml" \
-    logging.log_code_state="False" \
-    training.finetune="False" \
-    training.run_test_only="True" \
-    # data.dataset.params.load_fixed_offsets_on_test="False" \
-    # data.dataset.params.iter_times="25"
-# uncomment these two lines to randomize offset and crop start selection. See the note below
-```
-
-Please note, since there is a small number of videos in the `VGGSound-Sparse` test set (a few hundred)
-we iterate the test set many times (e.g. `iter_times="25"` or `"50"`) with random offsets and starting points
-of the temporal crop (`data.dataset.params.load_fixed_offsets_on_test="False"`).
-We do this to get a more robust estimate (by reducing the std) of model performance.
-
-## Examples
-
-A minimal working example that makes a prediction for a sample video.
-The script will download all necessary checkpoints and configs automatically.
-
-Try our Colab notebook:
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1rawAPksDHUioSXcAbQTn_kMbDl3nYg8q?usp=sharing)
-
-A sample from the _LRS3 dataset_ (note, the video is in-sync):
-```bash
-# conda activate sparse_sync
-python ./scripts/example.py \
-  --exp_name "22-07-13T22-25-49" \
-  --vid_path "./data/lrs3/h264_uncropped_25fps_256side_16000hz_aac/pretrain/C8zY0oAdQrs/00018.mp4"
-# Prediction Results:
-# p=0.9753 (17.1400), "0.00" (10)
-```
-
-You may artificially create an offset (the audio track will be 1.4 seconds early):
-```bash
-python ./scripts/example.py \
-  --exp_name "22-07-13T22-25-49" \
-  --vid_path "./data/lrs3/h264_uncropped_25fps_256side_16000hz_aac/pretrain/C8zY0oAdQrs/00018.mp4" \
-  --offset_sec 1.4
-# Prediction Results:
-# p=0.8794 (14.7708), "1.40" (17)
-```
-
-Making the audio track to lag is also straightforward and can be achieved with a negative offset
-(note that we need to start the visual track later to accommodate the earlier start of the audio track):
-```bash
-python ./scripts/example.py \
-  --exp_name "22-07-13T22-25-49" \
-  --vid_path "./data/lrs3/h264_uncropped_25fps_256side_16000hz_aac/pretrain/C8zY0oAdQrs/00018.mp4" \
-  --offset_sec -2.0 \
-  --v_start_i_sec 4.0
-# Prediction Results:
-# p=0.9929 (15.0929), "-2.00" (0)
-```
-
-Similarly, this can be done for the model that was fine-tuned on _VGGSound-Sparse_
-(note that the `--exp_name` has changed):
-```bash
-python ./scripts/example.py \
-  --exp_name "22-07-28T15-49-45" \
-  --vid_path "./data/vggsound/h264_video_25fps_256side_16000hz_aac/ZYc410CE4Rg_0_10000.mp4" \
-  --offset_sec 1.0
-# Prediction Results:
-# p=0.7762 (13.0838), "1.00" (15)
-
-```
-Also, the model that was fine-tuned on the _full VGGSound dataset_
-```bash
-python ./scripts/example.py \
-  --exp_name "22-09-21T21-00-52" \
-  --vid_path "./data/vggsound/h264_video_25fps_256side_16000hz_aac/3qesirWAGt4_20000_30000.mp4" \
-  --offset_sec 1.6
-# Prediction Results:
-# p=0.8652 (8.4451), "1.60" (18)
-```
+The main WACV evaluation uses 18 five-second windows with a two-second hop. StreamSync and APA results use the final window; non-streaming baselines use the best prediction across windows. For StreamSync-Trf, the paper reports 0.566 accuracy, 0.841 ±1-class accuracy, 0.959 ROC AUC, and 0.621 mAP. These are published results, not fresh measurements of this checkout.
 
 ## Citation
-Our paper was accepted for a spotlight presentation at the BMVC 2022.
-Please, use this BibTeX if you would like to cite our work:
+
+Please cite the WACV paper when using StreamSync or RealSync, and identify the code commit, dataset release, checkpoint, and evaluation subset used:
+
 ```bibtex
-@InProceedings{sparse2022iashin,
-  title={Sparse in Space and Time: Audio-visual Synchronisation with Trainable Selectors},
-  author={Iashin, V., Xie, W., Rahtu, E. and Zisserman, A.},
-  booktitle={British Machine Vision Conference (BMVC)},
-  year={2022}
+@InProceedings{Voas_2025_WACV,
+  author = {Voas, Jordan and Tseng, Wei-Cheng and Berry, Layne and Hu, Xixi and Peng, Puyuan and Stuedemann, James and Harwath, David},
+  title = {Temporally Streaming Audio-Visual Synchronization for Real-World Videos},
+  booktitle = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
+  month = {February},
+  year = {2025},
+  pages = {5009--5017}
 }
 ```
 
-## LICENSE
-This project is licensed under the MIT License. See LICENSE for more details.
+For the inherited snapshot model/code, also cite SparseSync:
 
-## Acknowledgements
-🙏 Thanks to all those who open-source their code:
-- The cleanest implementation of a transformer [minGPT](https://github.com/karpathy/minGPT)
-- A nice implementation of the [pre-trained S3D network in PyTorch](https://github.com/kylemin/S3D)
+```bibtex
+@InProceedings{sparse2022iashin,
+  title = {Sparse in Space and Time: Audio-visual Synchronisation with Trainable Selectors},
+  author = {Iashin, Vladimir and Xie, Weidi and Rahtu, Esa and Zisserman, Andrew},
+  booktitle = {British Machine Vision Conference (BMVC)},
+  year = {2022}
+}
+```
+
+Subsequent work: [Toward Robust Audio-Visual Synchronization Detection in Egocentric Video with Sparse Synchronization Events](https://bmvc2025.bmva.org/proceedings/903/) (BMVC 2025), with [AS-Synchformer code](https://github.com/jvoas655/AS-Synchformer).
+
+```bibtex
+@inproceedings{Voas_2025_BMVC,
+  author = {Jordan Voas and Wei-Cheng Tseng and Benoit Vallade and Alex Mackin and David Higham and David Harwath},
+  title = {Toward Robust Audio-Visual Synchronization Detection in Egocentric Video with Sparse Synchronization Events},
+  booktitle = {British Machine Vision Conference (BMVC)},
+  year = {2025},
+  url = {https://bmvc2025.bmva.org/proceedings/903/}
+}
+```
+
+RealSync's [citation guide](https://github.com/jvoas655/RealSync/blob/v0.1.0/docs/CITATIONS.md) documents source-publisher attribution and the S3FD, SyncNet, BEATs, and AudioSet contributions to its annotations.
+
+## License and acknowledgements
+
+The inherited code is MIT licensed; Vladimir Iashin's original copyright notice is retained in [LICENSE](LICENSE). This repository builds on [SparseSync](https://github.com/v-iashin/SparseSync), with inherited Transformer implementation patterns from [minGPT](https://github.com/karpathy/minGPT) and visual encoder code from [S3D](https://github.com/kylemin/S3D).
+
+The architecture figure is reproduced from the author-provided WACV paper source. Dataset metadata and source-media rights are described separately in the [RealSync release](https://github.com/jvoas655/RealSync).
