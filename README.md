@@ -1,5 +1,12 @@
 # UT Fork of SparseSync
 
+## RealSync dataset (WACV 2025)
+
+RealSync accompanies [Temporally Streaming Audio-Visual Synchronization for Real-World Videos](https://openaccess.thecvf.com/content/WACV2025/papers/Voas_Temporally_Streaming_Audio-Visual_Synchronization_for_Real-World_Videos_WACV_2025_paper.pdf).
+The dataset manifests, annotations, preparation tools, and documentation are maintained separately in [jvoas655/RealSync](https://github.com/jvoas655/RealSync).
+The public [v0.1.0 release](https://github.com/jvoas655/RealSync/releases/tag/v0.1.0) contains the verified cleaned uniform-offset manifests and saved talking-head, voice-over, and BEATs annotations. Researchers obtain source videos separately. Complete reconstruction from full source videos remains pending; the dataset repository documents the remaining cutting, preprocessing, and timing checks.
+
+
 To run tests with the original model architecture, set model.params.transformer.params.ablate_mixer and model.params.transformer.params.ablate_selector to "True" in the config file. To run tests with the additional features added by James, set both to "False". 
 
 Below README.md file is from the original SparseSync repo. This fork exists for evaluating SparseSync on our data and experimenting with modifications to the SparseSync architecture. 
